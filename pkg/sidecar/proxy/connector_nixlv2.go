@@ -176,11 +176,21 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	sessionID := s.bidirectionalSessionID(r)
 	if sessionID != "" && s.conversationCache != nil {
 		if cached, ok := s.conversationCache.Get(sessionID); ok {
-			kvParams := completionRequest[requestFieldKVTransferParams].(map[string]any)
-			for k, v := range cached {
-				kvParams[k] = v
+			// Apply threshold check: only inject if remote_num_tokens >= threshold.
+			// Below the threshold, prefill recomputes locally to amortize transfer latency.
+			remoteTokens := 0
+			if tokens, ok := cached["remote_num_tokens"].(float64); ok {
+				remoteTokens = int(tokens)
 			}
-			s.logger.V(logging.DEBUG).Info("injected cached kv_transfer_params", "session", sessionID)
+			if remoteTokens >= s.config.BidirectionalRecomputeThreshold {
+				kvParams := completionRequest[requestFieldKVTransferParams].(map[string]any)
+				for k, v := range cached {
+					kvParams[k] = v
+				}
+				s.logger.V(logging.DEBUG).Info("injected cached kv_transfer_params", "session", sessionID, "remote_tokens", remoteTokens)
+			} else {
+				s.logger.V(logging.DEBUG).Info("skipped D→P transfer (below threshold)", "session", sessionID, "remote_tokens", remoteTokens, "threshold", s.config.BidirectionalRecomputeThreshold)
+			}
 		}
 	}
 

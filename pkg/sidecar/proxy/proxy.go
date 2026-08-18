@@ -246,6 +246,10 @@ type Config struct {
 	// BidirectionalSessionHeader is the request header EPP injects carrying the
 	// session identifier used as the cache key. Defaults to x-session-token.
 	BidirectionalSessionHeader string
+	// BidirectionalRecomputeThreshold is the minimum number of remote tokens
+	// required to trigger a D→P pull. Below this threshold, prefill recomputes
+	// locally instead of pulling to amortize transfer latency.
+	BidirectionalRecomputeThreshold int
 
 	// EnableSSRFProtection enables SSRF protection using InferencePool allowlisting.
 	EnableSSRFProtection bool

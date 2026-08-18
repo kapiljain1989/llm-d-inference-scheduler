@@ -65,10 +65,11 @@ const (
 	p2pConnectorPortFlag       = "p2p-connector-port"
 	enableP2PPull              = "enable-p2p-pull"
 	enableBidirectionalKVXfer  = "enable-bidirectional-kv-xfer"
-	bidirectionalCacheSize     = "bidirectional-cache-size"
-	bidirectionalCacheTTL      = "bidirectional-cache-ttl"
-	bidirectionalSessionHeader = "bidirectional-session-header"
-	enableSSRFProtection       = "enable-ssrf-protection"
+	bidirectionalCacheSize         = "bidirectional-cache-size"
+	bidirectionalCacheTTL          = "bidirectional-cache-ttl"
+	bidirectionalSessionHeader     = "bidirectional-session-header"
+	bidirectionalRecomputeThreshold = "bidirectional-recompute-threshold"
+	enableSSRFProtection           = "enable-ssrf-protection"
 	enablePrefillerSampling    = "enable-prefiller-sampling"
 	enableTLS                  = "enable-tls"
 	tlsInsecureSkipVerify      = "tls-insecure-skip-verify"
@@ -124,11 +125,12 @@ type yamlConfiguration struct {
 	EnableSSRFProtection       *bool    `json:"enable-ssrf-protection,omitempty"`
 	EnablePrefillerSampling    *bool    `json:"enable-prefiller-sampling,omitempty"`
 	EnableP2PPull              *bool    `json:"enable-p2p-pull,omitempty"`
-	EnableBidirectionalKVXfer  *bool    `json:"enable-bidirectional-kv-xfer,omitempty"`
-	BidirectionalCacheSize     int      `json:"bidirectional-cache-size,omitempty"`
-	BidirectionalCacheTTL      string   `json:"bidirectional-cache-ttl,omitempty"`
-	BidirectionalSessionHeader string   `json:"bidirectional-session-header,omitempty"`
-	SecureServing              *bool    `json:"secure-proxy,omitempty"`
+	EnableBidirectionalKVXfer    *bool    `json:"enable-bidirectional-kv-xfer,omitempty"`
+	BidirectionalCacheSize       int      `json:"bidirectional-cache-size,omitempty"`
+	BidirectionalCacheTTL        string   `json:"bidirectional-cache-ttl,omitempty"`
+	BidirectionalSessionHeader   string   `json:"bidirectional-session-header,omitempty"`
+	BidirectionalRecomputeThreshold int   `json:"bidirectional-recompute-threshold,omitempty"`
+	SecureServing                *bool    `json:"secure-proxy,omitempty"`
 	CertPath                   string   `json:"cert-path,omitempty"`
 	EnableTLS                  []string `json:"enable-tls,omitempty"`
 	TLSInsecureSkipVerify      []string `json:"tls-insecure-skip-verify,omitempty"`
@@ -251,10 +253,11 @@ func NewOptions() *Options {
 			MoRIIODPSizeLocal: 0,
 			MoRIIODecodeHosts: nil,
 
-			BidirectionalKVXfer:        false,
-			BidirectionalCacheSize:     4096,
-			BidirectionalCacheTTL:      480 * time.Second,
-			BidirectionalSessionHeader: "x-session-token",
+			BidirectionalKVXfer:             false,
+			BidirectionalCacheSize:          4096,
+			BidirectionalCacheTTL:           480 * time.Second,
+			BidirectionalSessionHeader:      "x-session-token",
+			BidirectionalRecomputeThreshold: 64,
 		},
 		vllmPort:      defaultVLLMPort,
 		inferencePool: os.Getenv(envInferencePool),
@@ -296,6 +299,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"TTL for kv_transfer_params cache entries. Should match the vLLM engine's decoder_kv_blocks_ttl.")
 	fs.StringVar(&opts.BidirectionalSessionHeader, bidirectionalSessionHeader, opts.BidirectionalSessionHeader,
 		"request header carrying the session identifier EPP injects, used as the cache key.")
+	fs.IntVar(&opts.BidirectionalRecomputeThreshold, bidirectionalRecomputeThreshold, opts.BidirectionalRecomputeThreshold,
+		"minimum number of remote tokens required to trigger a D→P pull. Below this threshold, prefill recomputes locally instead of pulling to amortize transfer latency.")
 	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Enables secure proxy. Defaults to true.")
 	fs.StringVar(&opts.CertPath, certPath, opts.CertPath, "The path to the certificate for secure proxy. The certificate and private key files are assumed to be named tls.crt and tls.key, respectively. If not set, and secureProxy is enabled, then a self-signed certificate is used (for testing).")
 	fs.BoolVar(&opts.EnableSSRFProtection, enableSSRFProtection, opts.EnableSSRFProtection, "enable SSRF protection using InferencePool allowlisting")
@@ -695,6 +700,9 @@ func (opts *Options) Validate() error {
 		if opts.BidirectionalCacheTTL <= 0 {
 			return fmt.Errorf("--bidirectional-cache-ttl must be > 0 (got %s)", opts.BidirectionalCacheTTL)
 		}
+		if opts.BidirectionalRecomputeThreshold < 0 {
+			return fmt.Errorf("--bidirectional-recompute-threshold must be >= 0 (got %d)", opts.BidirectionalRecomputeThreshold)
+		}
 	}
 
 	// Validate SSRF protection requirements
@@ -850,6 +858,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.BidirectionalSessionHeader != "" && !opts.isFlagSet(bidirectionalSessionHeader) {
 		opts.BidirectionalSessionHeader = cfg.BidirectionalSessionHeader
+	}
+	if cfg.BidirectionalRecomputeThreshold != 0 && !opts.isFlagSet(bidirectionalRecomputeThreshold) {
+		opts.BidirectionalRecomputeThreshold = cfg.BidirectionalRecomputeThreshold
 	}
 
 	if cfg.SecureServing != nil && !opts.isFlagSet(secureServing) {
