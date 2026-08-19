@@ -55,36 +55,36 @@ const (
 	MoRIIOFeatureEnabled = true
 
 	// Flags
-	port                       = "port"
-	modelServerPort            = "model-server-port"
-	vllmPort                   = "vllm-port"
-	dataParallelSize           = "data-parallel-size"
-	kvConnector                = "kv-connector"
-	ecConnector                = "ec-connector"
-	mooncakeBootstrapPortFlag  = "mooncake-bootstrap-port"
-	p2pConnectorPortFlag       = "p2p-connector-port"
-	enableP2PPull              = "enable-p2p-pull"
-	enableBidirectionalKVXfer  = "enable-bidirectional-kv-xfer"
-	bidirectionalCacheSize         = "bidirectional-cache-size"
-	bidirectionalCacheTTL          = "bidirectional-cache-ttl"
-	bidirectionalSessionHeader     = "bidirectional-session-header"
+	port                            = "port"
+	modelServerPort                 = "model-server-port"
+	vllmPort                        = "vllm-port"
+	dataParallelSize                = "data-parallel-size"
+	kvConnector                     = "kv-connector"
+	ecConnector                     = "ec-connector"
+	mooncakeBootstrapPortFlag       = "mooncake-bootstrap-port"
+	p2pConnectorPortFlag            = "p2p-connector-port"
+	enableP2PPull                   = "enable-p2p-pull"
+	enableBidirectionalKVXfer       = "enable-bidirectional-kv-xfer"
+	bidirectionalCacheSize          = "bidirectional-cache-size"
+	bidirectionalCacheTTL           = "bidirectional-cache-ttl"
+	bidirectionalSessionHeader      = "bidirectional-session-header"
 	bidirectionalRecomputeThreshold = "bidirectional-recompute-threshold"
-	enableSSRFProtection           = "enable-ssrf-protection"
-	enablePrefillerSampling    = "enable-prefiller-sampling"
-	enableTLS                  = "enable-tls"
-	tlsInsecureSkipVerify      = "tls-insecure-skip-verify"
-	secureServing              = "secure-proxy"
-	certPath                   = "cert-path"
-	inferencePool              = "inference-pool"
-	poolGroup                  = "pool-group"
-	maxIdleConnsPerHost        = "max-idle-conns-per-host"
-	prefillMaxRetries          = "prefill-max-retries"
-	prefillRetryBackoff        = "prefill-retry-backoff"
-	decodeChunkSize            = "decode-chunk-size"
-	inlineConfiguration        = "configuration"
-	configurationFile          = "configuration-file"
-	tracingFlag                = "tracing"
-	metricsPort                = "metrics-port"
+	enableSSRFProtection            = "enable-ssrf-protection"
+	enablePrefillerSampling         = "enable-prefiller-sampling"
+	enableTLS                       = "enable-tls"
+	tlsInsecureSkipVerify           = "tls-insecure-skip-verify"
+	secureServing                   = "secure-proxy"
+	certPath                        = "cert-path"
+	inferencePool                   = "inference-pool"
+	poolGroup                       = "pool-group"
+	maxIdleConnsPerHost             = "max-idle-conns-per-host"
+	prefillMaxRetries               = "prefill-max-retries"
+	prefillRetryBackoff             = "prefill-retry-backoff"
+	decodeChunkSize                 = "decode-chunk-size"
+	inlineConfiguration             = "configuration"
+	configurationFile               = "configuration-file"
+	tracingFlag                     = "tracing"
+	metricsPort                     = "metrics-port"
 
 	// Environment variables
 	envInferencePool           = "INFERENCE_POOL"
@@ -114,34 +114,34 @@ const (
 
 // yamlConfiguration represents structure of YAML configuration for sidecar proxy
 type yamlConfiguration struct {
-	Port                       int      `json:"port,omitempty"`
-	ModelServerPort            int      `json:"model-server-port,omitempty"`
-	VLLMPort                   int      `json:"vllm-port,omitempty"`
-	MooncakeBootstrapPort      int      `json:"mooncake-bootstrap-port,omitempty"`
-	P2PConnectorPort           int      `json:"p2p-connector-port,omitempty"`
-	DataParallelSize           int      `json:"data-parallel-size,omitempty"`
-	KVConnector                string   `json:"kv-connector,omitempty"`
-	ECConnector                string   `json:"ec-connector,omitempty"`
-	EnableSSRFProtection       *bool    `json:"enable-ssrf-protection,omitempty"`
-	EnablePrefillerSampling    *bool    `json:"enable-prefiller-sampling,omitempty"`
-	EnableP2PPull              *bool    `json:"enable-p2p-pull,omitempty"`
-	EnableBidirectionalKVXfer    *bool    `json:"enable-bidirectional-kv-xfer,omitempty"`
-	BidirectionalCacheSize       int      `json:"bidirectional-cache-size,omitempty"`
-	BidirectionalCacheTTL        string   `json:"bidirectional-cache-ttl,omitempty"`
-	BidirectionalSessionHeader   string   `json:"bidirectional-session-header,omitempty"`
-	BidirectionalRecomputeThreshold int   `json:"bidirectional-recompute-threshold,omitempty"`
-	SecureServing                *bool    `json:"secure-proxy,omitempty"`
-	CertPath                   string   `json:"cert-path,omitempty"`
-	EnableTLS                  []string `json:"enable-tls,omitempty"`
-	TLSInsecureSkipVerify      []string `json:"tls-insecure-skip-verify,omitempty"`
-	InferencePool              string   `json:"inference-pool,omitempty"`
-	PoolGroup                  string   `json:"pool-group,omitempty"`
-	MaxIdleConnsPerHost        int      `json:"max-idle-conns-per-host,omitempty"`
-	PrefillMaxRetries          *int     `json:"prefill-max-retries,omitempty"`
-	PrefillRetryBackoff        string   `json:"prefill-retry-backoff,omitempty"`
-	DecodeChunkSize            int      `json:"decode-chunk-size,omitempty"`
-	Tracing                    *bool    `json:"tracing,omitempty"`
-	MetricsPort                int      `json:"metrics-port,omitempty"`
+	Port                            int      `json:"port,omitempty"`
+	ModelServerPort                 int      `json:"model-server-port,omitempty"`
+	VLLMPort                        int      `json:"vllm-port,omitempty"`
+	MooncakeBootstrapPort           int      `json:"mooncake-bootstrap-port,omitempty"`
+	P2PConnectorPort                int      `json:"p2p-connector-port,omitempty"`
+	DataParallelSize                int      `json:"data-parallel-size,omitempty"`
+	KVConnector                     string   `json:"kv-connector,omitempty"`
+	ECConnector                     string   `json:"ec-connector,omitempty"`
+	EnableSSRFProtection            *bool    `json:"enable-ssrf-protection,omitempty"`
+	EnablePrefillerSampling         *bool    `json:"enable-prefiller-sampling,omitempty"`
+	EnableP2PPull                   *bool    `json:"enable-p2p-pull,omitempty"`
+	EnableBidirectionalKVXfer       *bool    `json:"enable-bidirectional-kv-xfer,omitempty"`
+	BidirectionalCacheSize          int      `json:"bidirectional-cache-size,omitempty"`
+	BidirectionalCacheTTL           string   `json:"bidirectional-cache-ttl,omitempty"`
+	BidirectionalSessionHeader      string   `json:"bidirectional-session-header,omitempty"`
+	BidirectionalRecomputeThreshold int      `json:"bidirectional-recompute-threshold,omitempty"`
+	SecureServing                   *bool    `json:"secure-proxy,omitempty"`
+	CertPath                        string   `json:"cert-path,omitempty"`
+	EnableTLS                       []string `json:"enable-tls,omitempty"`
+	TLSInsecureSkipVerify           []string `json:"tls-insecure-skip-verify,omitempty"`
+	InferencePool                   string   `json:"inference-pool,omitempty"`
+	PoolGroup                       string   `json:"pool-group,omitempty"`
+	MaxIdleConnsPerHost             int      `json:"max-idle-conns-per-host,omitempty"`
+	PrefillMaxRetries               *int     `json:"prefill-max-retries,omitempty"`
+	PrefillRetryBackoff             string   `json:"prefill-retry-backoff,omitempty"`
+	DecodeChunkSize                 int      `json:"decode-chunk-size,omitempty"`
+	Tracing                         *bool    `json:"tracing,omitempty"`
+	MetricsPort                     int      `json:"metrics-port,omitempty"`
 }
 
 // Options holds the CLI-facing configuration for the pd-sidecar proxy.
