@@ -96,7 +96,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				],
 				"max_tokens": 50,
 				"stream": true,
-				"stream_options": {"include_usage": true}
+				"stream_options": {"include_usage": true},
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
@@ -182,7 +183,7 @@ var _ = Describe("NIXL Connector (v2)", func() {
 
 		tools := `[{"type":"function","function":{"name":"example","parameters":{"properties":{"some-parameter":{"type":"string"},"xyz":{"type":"string"},"123":{"type":"string"},"another-parameter":{"type":"string"}}}}}]`
 		messages := `[{"role":"user","content":[{"type":"text","text":"Hello"}]}]`
-		body := `{"model":"Qwen/Qwen2-0.5B","messages":` + messages + `,"max_tokens":50,"tools":` + tools + `}`
+		body := `{"model":"Qwen/Qwen2-0.5B","messages":` + messages + `,"max_tokens":50,"tools":` + tools + `,"conversation_id":"test-conv-1"}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 		Expect(err).ToNot(HaveOccurred())
@@ -303,7 +304,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				  {"role": "user", "content": "Hello"}
 				],
 				"max_tokens": 100,
-				"min_tokens": 5
+				"min_tokens": 5,
+				"conversation_id": "test-conv-1"
 			}`)
 
 		prefillReq := testInfo.prefillHandler.CompletionRequests[0]
@@ -322,7 +324,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				"model": "Qwen/Qwen2-0.5B",
 				"messages": [
 				  {"role": "user", "content": "Hello"}
-				]
+				],
+				"conversation_id": "test-conv-1"
 			}`)
 
 		prefillReq := testInfo.prefillHandler.CompletionRequests[0]
@@ -346,7 +349,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				"messages": [
 				  {"role": "user", "content": "Hello"}
 				],
-				"max_tokens": 50
+				"max_tokens": 50,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+MessagesPath, bytes.NewReader([]byte(body)))
@@ -389,7 +393,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				"messages": [
 				  {"role": "user", "content": "Hello"}
 				],
-				"max_tokens": 50
+				"max_tokens": 50,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+MessagesPath, bytes.NewReader([]byte(body)))
@@ -429,7 +434,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		body := `{
 				"model": "gpt-4o",
 				"input": "Hello, how are you?",
-				"max_output_tokens": 50
+				"max_output_tokens": 50,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ResponsesPath, strings.NewReader(body))
@@ -494,7 +500,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		body := `{
 				"model": "gpt-4o",
 				"input": "Tell me a story",
-				"max_output_tokens": 100
+				"max_output_tokens": 100,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ResponsesPath, strings.NewReader(body))
@@ -545,7 +552,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		By("sending a /v1/responses request without max_output_tokens")
 		body := `{
 				"model": "gpt-4o",
-				"input": "Hello!"
+				"input": "Hello!",
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ResponsesPath, strings.NewReader(body))
@@ -597,7 +605,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		body := `{
 				"model": "gpt-4o",
 				"input": "Hello, how are you?",
-				"max_output_tokens": 50
+				"max_output_tokens": 50,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ResponsesPath, strings.NewReader(body))
@@ -747,7 +756,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				"model": "gpt-4o",
 				"input": "Hello!",
 				"max_output_tokens": 50,
-				"stream": true
+				"stream": true,
+				"conversation_id": "test-conv-1"
 			}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ResponsesPath, strings.NewReader(body))
@@ -824,7 +834,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		startProxyAndSendGenerate(`{
 				"model": "Qwen/Qwen2-0.5B",
 				"token_ids": [1, 2, 3, 4],
-				"sampling_params": {"max_tokens": 50}
+				"sampling_params": {"max_tokens": 50},
+				"conversation_id": "test-conv-1"
 			}`, true)
 
 		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 1))
@@ -848,7 +859,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		startProxyAndSendGenerate(`{
 				"model": "Qwen/Qwen2-0.5B",
 				"token_ids": [1, 2, 3, 4],
-				"sampling_params": {"max_tokens": 100, "min_tokens": 5}
+				"sampling_params": {"max_tokens": 100, "min_tokens": 5},
+				"conversation_id": "test-conv-1"
 			}`, true)
 
 		prefillSP := samplingParamsOf(testInfo.prefillHandler.CompletionRequests[0])
@@ -864,7 +876,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		startProxyAndSendGenerate(`{
 				"model": "Qwen/Qwen2-0.5B",
 				"token_ids": [1, 2, 3, 4],
-				"sampling_params": {"temperature": 0.7}
+				"sampling_params": {"temperature": 0.7},
+				"conversation_id": "test-conv-1"
 			}`, true)
 
 		prefillSP := samplingParamsOf(testInfo.prefillHandler.CompletionRequests[0])
@@ -880,7 +893,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 	It("should cap prefill and drop synthesized sampling_params in decode when the request omits it", func() {
 		startProxyAndSendGenerate(`{
 				"model": "Qwen/Qwen2-0.5B",
-				"token_ids": [1, 2, 3, 4]
+				"token_ids": [1, 2, 3, 4],
+				"conversation_id": "test-conv-1"
 			}`, true)
 
 		prefillSP := samplingParamsOf(testInfo.prefillHandler.CompletionRequests[0])
@@ -895,7 +909,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		startProxyAndSendGenerate(`{
 				"model": "Qwen/Qwen2-0.5B",
 				"token_ids": [1, 2, 3, 4],
-				"sampling_params": {"max_tokens": 50}
+				"sampling_params": {"max_tokens": 50},
+				"conversation_id": "test-conv-1"
 			}`, false)
 
 		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 0))
@@ -965,7 +980,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		body := `{
 			"model": "Qwen/Qwen2-0.5B",
 			"messages": [{"role": "user", "content": "Hello"}],
-			"max_tokens": 50
+			"max_tokens": 50,
+			"conversation_id": "test-conv-1"
 		}`
 
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
@@ -1115,7 +1131,8 @@ var _ = Describe("NIXL Connector (v2)", func() {
 				  {"role": "user", "content": "Hello"}
 				],
 				"max_tokens": 100,
-				"min_tokens": 5
+				"min_tokens": 5,
+				"conversation_id": "test-conv-1"
 			}`)
 
 		prefillReq := env.prefillHandler.GetCompletionRequests()[0]
@@ -1313,7 +1330,7 @@ var _ = Describe("Bidirectional KV Transfer", func() {
 		testInfo.proxy.config.BidirectionalCacheSize = 100
 		testInfo.proxy.config.BidirectionalCacheTTL = 5 * time.Minute
 		testInfo.proxy.config.BidirectionalRecomputeThreshold = 64
-		testInfo.proxy.config.PodHostname = "test-pod-123"
+		testInfo.proxy.config.PodHostname = "default/test-pod-123"
 		// Create conversation cache (proxy was created before config was set)
 		testInfo.proxy.conversationCache = expirable.NewLRU[string, map[string]any](
 			testInfo.proxy.config.BidirectionalCacheSize,
@@ -1343,13 +1360,13 @@ var _ = Describe("Bidirectional KV Transfer", func() {
 	}
 
 	validSessionToken := func() string {
-		// EPP-issued token: base64(pod_hostname)
-		return base64.StdEncoding.EncodeToString([]byte("test-pod-123"))
+		// EPP-issued token: base64(namespace/pod_name)
+		return base64.StdEncoding.EncodeToString([]byte("default/test-pod-123"))
 	}
 
 	invalidSessionToken := func() string {
 		// Token from different pod - should be rejected
-		return base64.StdEncoding.EncodeToString([]byte("different-pod-456"))
+		return base64.StdEncoding.EncodeToString([]byte("default/different-pod-456"))
 	}
 
 	sendRequestWithSessionToken := func(proxyBaseAddr, sessionToken string) (*http.Response, []byte) {
@@ -1581,7 +1598,7 @@ data: [DONE]
 
 		By("Turn 1: cache should be populated from SSE stream")
 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath,
-			bytes.NewReader([]byte(`{"model":"test","messages":[],"stream":true}`)))
+			bytes.NewReader([]byte(`{"model":"test","messages":[],"stream":true,"conversation_id":"test-conv-1"}`)))
 		Expect(err).ToNot(HaveOccurred())
 		req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
 		req.Header.Add("x-session-token", sessionToken)
@@ -1601,5 +1618,315 @@ data: [DONE]
 
 		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
 		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteEngineID, "engine-stream"))
+	})
+
+	// Reproducer 1: Token format validation
+	It("Reproducer 1: session token must be base64(namespace/pod_name)", func() {
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-abc",
+				"remote_num_tokens":100
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		validToken := base64.StdEncoding.EncodeToString([]byte("test-pod-123"))
+
+		By("Turn 1 with valid token (default/test-pod-123): cache kv_transfer_params")
+		rp1, body1 := sendRequestWithSessionToken(proxyBaseAddr, validToken)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK), string(body1))
+		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 1))
+
+		By("Turn 2 with different token (default/different-pod): should NOT inject cached params")
+		differentToken := base64.StdEncoding.EncodeToString([]byte("default/different-pod"))
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, differentToken)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 2))
+
+		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		// Different pod token should NOT have injected cached params from valid token's session
+		Expect(turn2KV[requestFieldRemoteEngineID]).To(BeNil(), "should not inject params to different session")
+	})
+
+	// Reproducer 2: Required transfer field validation
+	It("Reproducer 2: kv_transfer_params must have required fields for cache", func() {
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionToken := validSessionToken()
+
+		By("Turn 1: decode response missing remote_num_tokens")
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-incomplete",
+				"remote_block_ids":[[1,2]]
+			}
+		}`
+		rp1, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2: should not inject cache without remote_num_tokens")
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+
+		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		// Cache should not be used because remote_num_tokens was missing
+		Expect(turn2KV[requestFieldRemoteEngineID]).To(BeNil(), "incomplete kv_transfer_params should not be cached")
+	})
+
+	// Reproducer 3: Conversation isolation
+	It("Reproducer 3: conversation isolation - different sessions have separate caches", func() {
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-session-a",
+				"remote_block_ids":[[1,2,3]],
+				"remote_num_tokens":100
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionA := base64.StdEncoding.EncodeToString([]byte("default/test-pod-123"))
+
+		By("Turn 1 with session A: populate cache with engine-session-a")
+		rp1, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionA)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2 with session A: should inject engine-session-a")
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2-a","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionA)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+
+		turn2aKV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2aKV).To(HaveKeyWithValue(requestFieldRemoteEngineID, "engine-session-a"))
+
+		By("Turn 1 with session B (same pod): should start with fresh cache")
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-456",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-session-b",
+				"remote_block_ids":[[4,5,6]],
+				"remote_num_tokens":100
+			}
+		}`
+		sessionB := base64.StdEncoding.EncodeToString([]byte("default/test-pod-123"))
+		rp3, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionB)
+		Expect(rp3.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2 with session B: should inject engine-session-b (NOT engine-session-a)")
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2-b","choices":[],"usage":{}}`
+		rp4, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionB)
+		Expect(rp4.StatusCode).To(Equal(http.StatusOK))
+
+		// Should have 4 prefill requests: A-Turn1, A-Turn2, B-Turn1, B-Turn2
+		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 4))
+		turn2bKV := testInfo.prefillHandler.CompletionRequests[3][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2bKV).To(HaveKeyWithValue(requestFieldRemoteEngineID, "engine-session-b"))
+	})
+
+	// Reproducer 4: DP cache initialization
+	It("Reproducer 4: data parallel cache initialized when bidirectional KV enabled", func() {
+		By("proxy should have initialized conversation cache before processing requests")
+		Expect(testInfo.proxy.conversationCache).NotTo(BeNil())
+
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-abc",
+				"remote_block_ids":[[1,2,3]],
+				"remote_num_tokens":100,
+				"tp_size":2,
+				"dp_size":4
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionToken := validSessionToken()
+
+		By("sending request with DP metadata in kv_transfer_params")
+		rp1, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2: cache should preserve DP metadata")
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+
+		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldTPSize, float64(2)))
+		Expect(turn2KV).To(HaveKeyWithValue("dp_size", float64(4)))
+	})
+
+	// Reproducer 5: IPv6 endpoint support
+	It("Reproducer 5: IPv6 addresses in remote_host must be handled correctly", func() {
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-ipv6",
+				"remote_block_ids":[[1,2,3]],
+				"remote_host":"[fd00::1]",
+				"remote_port":5678,
+				"remote_num_tokens":100
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionToken := validSessionToken()
+
+		By("Turn 1: cache IPv6 address from decode response")
+		rp1, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2: prefill should receive cached IPv6 endpoint")
+		testInfo.decodeHandler.RawResponse = `{"id":"turn2","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+
+		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteHost, "[fd00::1]"))
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemotePort, float64(5678)))
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteEngineID, "engine-ipv6"))
+	})
+
+	// Reproducer 6: P1 Blocker - Conversation isolation (conversation_id required)
+	It("Reproducer 6: conversation_id required for cache - prevents cross-conversation reuse", func() {
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-123",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-conv-a",
+				"remote_block_ids":[[1,2,3]],
+				"remote_num_tokens":100
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionToken := validSessionToken()
+
+		By("Conversation A, Turn 1: cache with conversation_id='conv-a'")
+		reqA1 := bytes.NewReader([]byte(`{
+			"model":"test",
+			"messages":[{"role":"user","content":"hello"}],
+			"conversation_id":"conv-a"
+		}`))
+		req1, _ := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, reqA1)
+		req1.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+		req1.Header.Add("x-session-token", sessionToken)
+		rp1, _ := http.DefaultClient.Do(req1)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+		rp1.Body.Close()
+
+		By("Conversation B, Turn 1: different conversation_id='conv-b' on same pod")
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-456",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-conv-b",
+				"remote_block_ids":[[4,5,6]],
+				"remote_num_tokens":100
+			}
+		}`
+		reqB1 := bytes.NewReader([]byte(`{
+			"model":"test",
+			"messages":[{"role":"user","content":"different prompt"}],
+			"conversation_id":"conv-b"
+		}`))
+		req2, _ := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, reqB1)
+		req2.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+		req2.Header.Add("x-session-token", sessionToken)
+		rp2, _ := http.DefaultClient.Do(req2)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+		rp2.Body.Close()
+
+		By("Conversation A, Turn 2: verify NO injection from conv-b (different conversation)")
+		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-conv-a-turn2","choices":[],"usage":{}}`
+		reqA2 := bytes.NewReader([]byte(`{
+			"model":"test",
+			"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"response"}],
+			"conversation_id":"conv-a"
+		}`))
+		req3, _ := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, reqA2)
+		req3.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+		req3.Header.Add("x-session-token", sessionToken)
+		rp3, _ := http.DefaultClient.Do(req3)
+		Expect(rp3.StatusCode).To(Equal(http.StatusOK))
+		rp3.Body.Close()
+
+		By("Conversation B, Turn 2: verify NO injection from conv-a (different conversation)")
+		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-conv-b-turn2","choices":[],"usage":{}}`
+		reqB2 := bytes.NewReader([]byte(`{
+			"model":"test",
+			"messages":[{"role":"user","content":"different prompt"},{"role":"assistant","content":"response"}],
+			"conversation_id":"conv-b"
+		}`))
+		req4, _ := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, reqB2)
+		req4.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+		req4.Header.Add("x-session-token", sessionToken)
+		rp4, _ := http.DefaultClient.Do(req4)
+		Expect(rp4.StatusCode).To(Equal(http.StatusOK))
+		rp4.Body.Close()
+
+		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 4))
+
+		// Turn 2 of Conv A should NOT have Conv B's cached params
+		turn2aKV := testInfo.prefillHandler.CompletionRequests[2][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2aKV[requestFieldRemoteEngineID]).To(Equal("engine-conv-a"),
+			"conv-a turn 2 should inject conv-a's cache, not conv-b's")
+
+		// Turn 2 of Conv B should NOT have Conv A's cached params
+		turn2bKV := testInfo.prefillHandler.CompletionRequests[3][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2bKV[requestFieldRemoteEngineID]).To(Equal("engine-conv-b"),
+			"conv-b turn 2 should inject conv-b's cache, not conv-a's")
+	})
+
+	// Reproducer 7: P1 Blocker - NIXL remote_request_id preservation
+	It("Reproducer 7: NIXL remote_request_id must be preserved in bidirectional cache", func() {
+		testInfo.decodeHandler.RawResponse = `{
+			"id":"chatcmpl-decode-1",
+			"choices":[],
+			"usage":{"prompt_tokens":100},
+			"kv_transfer_params":{
+				"remote_engine_id":"engine-nixl",
+				"remote_request_id":"req-xyz-123",
+				"remote_block_ids":[[1,2,3]],
+				"remote_host":"10.0.1.100",
+				"remote_port":5678,
+				"remote_num_tokens":100
+			}
+		}`
+
+		proxyBaseAddr := startProxyWithBidirectional()
+		sessionToken := validSessionToken()
+
+		By("Turn 1: cache decode response including remote_request_id")
+		rp1, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp1.StatusCode).To(Equal(http.StatusOK))
+
+		By("Turn 2: prefill should receive cached remote_request_id for pull scheduler")
+		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-decode-2","choices":[],"usage":{}}`
+		rp2, _ := sendRequestWithSessionToken(proxyBaseAddr, sessionToken)
+		Expect(rp2.StatusCode).To(Equal(http.StatusOK))
+
+		turn2KV := testInfo.prefillHandler.CompletionRequests[1][requestFieldKVTransferParams].(map[string]any)
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteRequestID, "req-xyz-123"), "remote_request_id must be preserved for NIXL pull scheduler")
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteEngineID, "engine-nixl"))
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemoteHost, "10.0.1.100"))
+		Expect(turn2KV).To(HaveKeyWithValue(requestFieldRemotePort, float64(5678)))
 	})
 })

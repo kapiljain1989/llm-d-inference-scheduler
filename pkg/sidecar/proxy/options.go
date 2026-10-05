@@ -577,16 +577,17 @@ func (opts *Options) Complete() error {
 		opts.MoRIIODecodePodIP = resolved[0]
 	}
 
-	// Populate PodHostname for session token validation in bidirectional KV transfer.
-	// This is the hostname that EPP's encoded_endpoint_header strategy uses when
-	// generating session tokens as base64(pod_name). Only tokens that decode to this
-	// hostname are trusted, preventing clients from hijacking other pods' cached KV params.
+	// Populate PodIdentity for session token validation in bidirectional KV transfer.
+	// EPP's encoded_endpoint_header strategy generates tokens as base64(namespace/pod_name).
+	// We validate tokens by decoding and comparing to our own namespace/pod_name identity,
+	// preventing clients from hijacking other pods' cached KV params via cross-pod tokens.
 	if opts.BidirectionalKVXfer {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return fmt.Errorf("failed to get pod hostname for bidirectional KV transfer: %w", err)
+		namespace := os.Getenv("POD_NAMESPACE")
+		podName := os.Getenv("POD_NAME")
+		if namespace == "" || podName == "" {
+			return fmt.Errorf("bidirectional KV transfer requires POD_NAMESPACE and POD_NAME env vars (use Kubernetes downward API)")
 		}
-		opts.PodHostname = hostname
+		opts.PodHostname = namespace + "/" + podName
 	}
 
 	return nil

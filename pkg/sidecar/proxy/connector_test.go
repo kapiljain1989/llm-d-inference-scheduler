@@ -39,7 +39,8 @@ const chatCompletionsRequestBody = `{
 				"messages": [
 				  {"role": "user", "content": "Hello"}
 				],
-				"max_tokens": 50
+				"max_tokens": 50,
+				"conversation_id": "test-conv-1"
 			}`
 
 const chatCompletionsRequestBodyWithMaxCompletionTokens = `{
@@ -48,7 +49,8 @@ const chatCompletionsRequestBodyWithMaxCompletionTokens = `{
 				  {"role": "user", "content": "Hello"}
 				],
 				"max_tokens": 50,
-				"max_completion_tokens": 100
+				"max_completion_tokens": 100,
+				"conversation_id": "test-conv-1"
 			}`
 
 const chatCompletionsRequestBodyWithMinTokens = `{
@@ -57,7 +59,8 @@ const chatCompletionsRequestBodyWithMinTokens = `{
 				  {"role": "user", "content": "Hello"}
 				],
 				"max_tokens": 50,
-				"min_tokens": 5
+				"min_tokens": 5,
+				"conversation_id": "test-conv-1"
 			}`
 
 type sidecarTestInfo struct {

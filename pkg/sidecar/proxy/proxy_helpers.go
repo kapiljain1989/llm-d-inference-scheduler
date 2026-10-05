@@ -203,6 +203,7 @@ var inspectedRequestFields = map[string]struct{}{
 	requestFieldCacheHitThreshold:    {},
 	requestFieldContinueFinalMessage: {},
 	requestFieldAddGenerationPrompt:  {},
+	requestFieldConversationID:       {},
 }
 
 // requestMessages returns the request's messages, decoding the array on first

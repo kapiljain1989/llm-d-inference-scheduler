@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 )
 
@@ -69,6 +70,9 @@ const (
 	requestFieldCacheHitThreshold    = reqcommon.FieldCacheHitThreshold
 	requestFieldContinueFinalMessage = reqcommon.FieldContinueFinalMessage
 	requestFieldAddGenerationPrompt  = reqcommon.FieldAddGenerationPrompt
+
+	// requestFieldConversationID identifies the conversation for bidirectional KV cache isolation
+	requestFieldConversationID = "conversation_id"
 
 	// requestHeaderDataParallelRank pins a request to a specific vLLM
 	// data-parallel rank, set on both legs of a disagg pair (see pickDPRank).
@@ -107,6 +111,7 @@ const (
 
 	// Bidirectional KV transfer fields
 	requestFieldRemoteNumTokens    = "remote_num_tokens"
+	requestFieldRemoteRequestID    = "remote_request_id"
 	requestFieldTPSize             = "tp_size"
 	requestFieldRemoteBlocksExpiry = "remote_blocks_expiry_time"
 
@@ -489,41 +494,84 @@ func (s *Server) currentDecodePodIP(ctx context.Context) string {
 	return s.resolver().resolveOne(ctx, s.config.MoRIIODecodePodIPSpec)
 }
 
+// bidirectionalCacheKey generates the cache key for bidirectional KV transfer, combining
+// the session token (pod identity) with conversation_id to ensure proper conversation isolation.
+// Returns empty string if session token is invalid or conversation_id is missing from the request.
+func (s *Server) bidirectionalCacheKey(r *http.Request, body map[string]any) string {
+	sessionID := s.bidirectionalSessionID(r)
+	if sessionID == "" {
+		s.logger.V(logging.DEBUG).Info("bidirectional cache key generation failed: session ID validation failed")
+		return ""
+	}
+
+	// Extract conversation_id from request body. Required for conversation isolation:
+	// multiple conversations on the same pod must not share cached KV parameters.
+	conversationID, ok := body[requestFieldConversationID].(string)
+	if !ok || conversationID == "" {
+		// No conversation_id provided - cache key is empty, disabling cache for this request
+		s.logger.V(logging.DEBUG).Info("conversation_id missing or invalid, disabling bidirectional cache",
+			"session", sessionID, "body_keys", getBodyKeys(body))
+		return ""
+	}
+
+	// Combine session token and conversation_id for cache isolation
+	cacheKey := sessionID + ":" + conversationID
+	s.logger.V(logging.DEBUG).Info("generated bidirectional cache key",
+		"cache_key", cacheKey, "session", sessionID, "conversation", conversationID)
+	return cacheKey
+}
+
+// getBodyKeys returns the keys in the request body for debugging
+func getBodyKeys(body map[string]any) []string {
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // bidirectionalSessionID extracts and validates the session token from the request
 // for bidirectional KV transfer. Returns empty string if:
 // - Feature is disabled
 // - Session header is missing
-// - Token fails security validation (doesn't decode to PodHostname)
+// - Token fails security validation (doesn't decode to the current pod's namespace/name)
 //
-// Security: EPP's encoded_endpoint_header strategy generates tokens as base64(pod_name).
-// Only tokens that decode to the current pod's hostname are trusted, preventing clients
+// Security: EPP's encoded_endpoint_header strategy generates tokens as base64(namespace/pod_name).
+// Only tokens that decode to the current pod's NamespacedName are trusted, preventing clients
 // from hijacking other pods' cached kv_transfer_params by supplying arbitrary tokens.
 func (s *Server) bidirectionalSessionID(r *http.Request) string {
 	if !s.config.BidirectionalKVXfer {
+		s.logger.V(logging.DEBUG).Info("bidirectional KV transfer disabled")
 		return ""
 	}
 
 	token := r.Header.Get(s.config.BidirectionalSessionHeader)
 	if token == "" {
+		s.logger.V(logging.DEBUG).Info("session token header missing",
+			"header", s.config.BidirectionalSessionHeader)
 		return ""
 	}
 
-	// Validate token is EPP-issued by decoding and comparing to PodHostname.
-	// EPP's encoded_endpoint_header generates token = base64(pod_name).
+	// Validate token is EPP-issued by decoding and comparing to our pod identity.
+	// EPP's encoded_endpoint_header generates token = base64(namespace/pod_name).
 	decoded, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
 		// Invalid base64 - not an EPP-issued token
+		s.logger.V(logging.DEBUG).Info("session token decode failed",
+			"token", token, "error", err.Error())
 		return ""
 	}
 
 	if string(decoded) != s.config.PodHostname {
-		// Token doesn't match current pod - client attempting cross-pod access
-		s.logger.V(4).Info("rejected session token: hostname mismatch",
-			"token_hostname", string(decoded),
-			"pod_hostname", s.config.PodHostname)
+		// Token doesn't match current pod identity - client attempting cross-pod access
+		s.logger.V(logging.DEBUG).Info("rejected session token: pod identity mismatch",
+			"token_pod_id", string(decoded),
+			"pod_id", s.config.PodHostname)
 		return ""
 	}
 
+	s.logger.V(logging.DEBUG).Info("session token validated successfully",
+		"token_pod_id", string(decoded))
 	return token
 }
 
@@ -613,7 +661,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Clone returns a clone of the current Server struct.
 // Note: decoderURL and decoderProxy are intentionally not copied — callers (e.g. startDataParallel)
-// always set them explicitly after cloning.
+// always set them explicitly after cloning. conversationCache is shared (pointer copy) so all
+// cloned servers share the same bidirectional KV cache.
 func (s *Server) Clone() *Server {
 	return &Server{
 		addr:                s.addr,
@@ -631,6 +680,7 @@ func (s *Server) Clone() *Server {
 		forwardDataParallel: s.forwardDataParallel,
 		prefillSamplerFn:    s.prefillSamplerFn,
 		dpBasePort:          s.dpBasePort,
+		conversationCache:   s.conversationCache,
 		config:              s.config,
 	}
 }

@@ -54,7 +54,7 @@ func tokenLimitMap(req map[string]any, apiType APIType) (map[string]any, bool) {
 
 func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort, kvCacheSource string, apiType APIType) {
 	tokenLimitFields := tokenLimitFieldsForAPIType(apiType)
-	s.logger.V(4).Info("running NIXL protocol V2", "url", prefillPodHostPort, "tokenLimitFields", tokenLimitFields)
+	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2", "url", prefillPodHostPort, "tokenLimitFields", tokenLimitFields)
 
 	original, completionRequest, ok := s.readJSONBody(r, w)
 	if !ok {
@@ -173,9 +173,9 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// Bidirectional KV transfer: inject cached decode params into prefill request.
 	// D-side GPU blocks take precedence over P2P CPU offload (composition skipped when cache hit).
 	usedBidirectionalCache := false
-	sessionID := s.bidirectionalSessionID(r)
-	if sessionID != "" && s.conversationCache != nil {
-		if cached, ok := s.conversationCache.Get(sessionID); ok {
+	cacheKey := s.bidirectionalCacheKey(r, completionRequest)
+	if cacheKey != "" && s.conversationCache != nil {
+		if cached, ok := s.conversationCache.Get(cacheKey); ok {
 			// Check if cached remote tokens exceed recompute threshold
 			remoteTokens := 0
 			if tokens, ok := cached[requestFieldRemoteNumTokens].(float64); ok {
@@ -186,13 +186,15 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 				kvParams := completionRequest[requestFieldKVTransferParams].(map[string]any)
 				allowedKeys := []string{
 					requestFieldRemoteEngineID,
-					requestFieldKVRequestID,
+					requestFieldRemoteRequestID,
 					requestFieldRemoteHost,
 					requestFieldRemotePort,
 					requestFieldRemoteBlockIDs,
 					requestFieldRemoteNumTokens,
 					requestFieldTPSize,
+					"dp_size",
 					requestFieldRemoteBlocksExpiry,
+					requestFieldRemoteKVSource,
 				}
 				for _, k := range allowedKeys {
 					if v, ok := cached[k]; ok {
@@ -201,19 +203,22 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 				}
 				usedBidirectionalCache = true
 				s.logger.V(logging.DEBUG).Info("injected cached kv_transfer_params",
-					"session", sessionID,
+					"cache_key", cacheKey,
 					"remote_tokens", remoteTokens,
 					"threshold", s.config.BidirectionalRecomputeThreshold)
 			} else {
 				s.logger.V(logging.DEBUG).Info("skipped D→P pull: below recompute threshold",
-					"session", sessionID,
+					"cache_key", cacheKey,
 					"remote_tokens", remoteTokens,
 					"threshold", s.config.BidirectionalRecomputeThreshold)
 			}
 		}
 	}
 
-	// Skip P2P pull when bidirectional cached params are used (D-side GPU blocks take precedence)
+	// Skip P2P pull when bidirectional cached params are used. D-side GPU blocks take
+	// precedence over CPU-tier P2P reuse. The bidirectional cache has already injected
+	// remote_kv_source if available, allowing the engine to make informed decisions about
+	// which source to use or whether to fall back if the GPU transfer fails.
 	if !usedBidirectionalCache {
 		// Compose the OffloadingConnector p2p pull onto the NIXL prefill leg.
 		s.addP2PPullToPrefill(completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
@@ -245,8 +250,10 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 
 	// 2. Forward request to prefiller
-	s.logger.V(4).Info("sending prefill request", "to", prefillPodHostPort)
-	s.logger.V(5).Info("Prefill request", "body", string(pbody))
+	s.logger.V(logging.DEBUG).Info("sending prefill request", "to", prefillPodHostPort)
+	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
+		trace.Info("Prefill request", logging.HTTPBodyKey, string(pbody))
+	}
 
 	// Retry on transient 5xx (502/503/504): these failures (e.g. connection
 	// reset → 502) are common when the prefill pod's accept queue overflows
@@ -331,7 +338,9 @@ retryLoop:
 		pCachedTokens = 0
 	}
 
-	s.logger.V(5).Info("received prefiller response", requestFieldKVTransferParams, pKVTransferParams)
+	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
+		trace.Info("received prefiller response", requestFieldKVTransferParams, pKVTransferParams)
+	}
 
 	// Decode Stage
 
@@ -463,14 +472,16 @@ retryLoop:
 
 	// 2. Forward to local decoder.
 
-	s.logger.V(5).Info("sending request to decoder", "body", string(dbody))
+	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
+		trace.Info("Decode request", logging.HTTPBodyKey, string(dbody))
+	}
 
 	// Wrap response writer for bidirectional KV transfer when enabled and session token is valid.
 	// The KV capture writer intercepts kv_transfer_params from the decode response without
 	// modifying the response body, then updates the conversation cache on finalize.
 	var kvCaptureFinalize func() map[string]any
 	baseWriter := w
-	if sessionID != "" && s.conversationCache != nil {
+	if s.bidirectionalSessionID(r) != "" && s.conversationCache != nil {
 		baseWriter, kvCaptureFinalize = newKVTransferParamsCaptureWriter(w)
 	}
 
@@ -479,7 +490,7 @@ retryLoop:
 	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
 
 	if !dataParallelUsed {
-		s.logger.V(4).Info("sending request to decoder", "to", s.config.DecoderURL.Host)
+		s.logger.V(logging.DEBUG).Info("sending request to decoder", "to", s.config.DecoderURL.Host)
 		decodeSpan.SetAttributes(attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host))
 		s.dispatchDecode(decodeWriter, dreq, completionRequest)
 	}
@@ -492,10 +503,13 @@ retryLoop:
 	// Update bidirectional KV cache with captured params from decode response
 	if kvCaptureFinalize != nil {
 		if capturedParams := kvCaptureFinalize(); capturedParams != nil {
-			s.conversationCache.Add(sessionID, capturedParams)
-			s.logger.V(logging.DEBUG).Info("cached kv_transfer_params from decode response",
-				"session", sessionID,
-				"params", capturedParams)
+			cacheKey := s.bidirectionalCacheKey(r, completionRequest)
+			if cacheKey != "" {
+				s.conversationCache.Add(cacheKey, capturedParams)
+				s.logger.V(logging.DEBUG).Info("cached kv_transfer_params from decode response",
+					"cache_key", cacheKey,
+					"params", capturedParams)
+			}
 		}
 	}
 
@@ -536,7 +550,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	w http.ResponseWriter, r *http.Request, original []byte,
 	completionRequest map[string]any, uuidStr, transferID, prefillPodHostPort, kvCacheSource string,
 ) {
-	s.logger.V(4).Info("running NIXL protocol V2 (concurrent dispatch)",
+	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2 (concurrent dispatch)",
 		"url", prefillPodHostPort, "request_id", uuidStr)
 
 	tracer := tracing.Tracer()
@@ -643,7 +657,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	completionRequest[requestFieldKVTransferParams] = map[string]any{
 		requestFieldDoRemotePrefill: true,
 		requestFieldDoRemoteDecode:  false,
-		requestFieldRemoteEngineID:  fmt.Sprintf("%s:%d", prefillHost, s.config.MoRIIOPrefillHandshakePort),
+		requestFieldRemoteEngineID:  net.JoinHostPort(prefillHost, strconv.Itoa(s.config.MoRIIOPrefillHandshakePort)),
 		// Empty (not nil) since decode allocates its own blocks in WRITE mode.
 		requestFieldRemoteBlockIDs:       []any{},
 		requestFieldRemoteHost:           prefillHost,
@@ -731,8 +745,10 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	dreq.Body = io.NopCloser(bytes.NewReader(dbody))
 	dreq.ContentLength = int64(len(dbody))
 
-	s.logger.V(5).Info("concurrent-dispatch prefill request body", "body", string(pbody))
-	s.logger.V(5).Info("concurrent-dispatch decode request body", "body", string(dbody))
+	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
+		trace.Info("concurrent-dispatch prefill request body", logging.HTTPBodyKey, string(pbody))
+		trace.Info("concurrent-dispatch decode request body", logging.HTTPBodyKey, string(dbody))
+	}
 
 	// Decode writes into a deferred writer that buffers everything until we
 	// commit() (prefill succeeded -> flush + stream on) or abort() (prefill
