@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +26,20 @@ import (
 const (
 	// LLMDRouterEndpointPickerSubsystem is the subsystem for llm-d router endpoint picker metrics.
 	LLMDRouterEndpointPickerSubsystem = "llm_d_epp"
+)
+
+// Disaggregation path label values, naming the stages a request is split into
+// across pods. The EPP, coordinator, and P/D sidecar label their metrics with
+// these values so dashboards can join the components on them.
+const (
+	// DisaggPathDecodeOnly is a request served without disaggregation.
+	DisaggPathDecodeOnly = "decode-only"
+	// DisaggPathPrefillDecode is a request split into prefill and decode (P/D or EP/D).
+	DisaggPathPrefillDecode = "prefill-decode"
+	// DisaggPathEncodeDecode is a request with remote encode and local prefill and decode (E/PD).
+	DisaggPathEncodeDecode = "encode-decode"
+	// DisaggPathEncodePrefillDecode is a request split into encode, prefill, and decode (E/P/D).
+	DisaggPathEncodePrefillDecode = "encode-prefill-decode"
 )
 
 // HelpMsgWithStability is a helper function to create a help message with stability level.

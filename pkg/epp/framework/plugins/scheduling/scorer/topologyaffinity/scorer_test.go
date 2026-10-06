@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -122,8 +122,13 @@ func TestScorer_Consumes(t *testing.T) {
 	consumes := s.Consumes()
 
 	assert.Empty(t, consumes.Required)
-	require.Len(t, consumes.Optional, 1)
+	require.Len(t, consumes.Optional, 2)
 	assert.Equal(t, attrtopology.Topology{}, consumes.Optional[s.dataKey])
+
+	// The peer endpoint the scorer grades against is a request attribute; the
+	// scorer reads it through topoutil.PeerTopology, so it belongs in Consumes.
+	require.Contains(t, consumes.Optional, disagg.PeerEndpointAttributeKey)
+	assert.Nil(t, consumes.Optional[disagg.PeerEndpointAttributeKey])
 }
 
 func TestFactory_Defaults(t *testing.T) {

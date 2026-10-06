@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
@@ -62,6 +63,19 @@ func (s stubStep) Execute(ctx context.Context, rc *pipeline.RequestContext) erro
 // stubGatewayURL is a placeholder used by tests that never actually issue a
 // passthrough request. A real value only matters in passthrough_test.go.
 const stubGatewayURL = "http://gateway-stub.invalid"
+
+type captureRevisionDecisionStep struct {
+	requestID          string
+	revisionDecisionID string
+}
+
+func (s *captureRevisionDecisionStep) Name() string { return "capture-revision-decision" }
+
+func (s *captureRevisionDecisionStep) Execute(_ context.Context, reqCtx *pipeline.RequestContext) error {
+	s.requestID = reqCtx.RequestID
+	s.revisionDecisionID = reqCtx.RevisionDecisionID
+	return nil
+}
 
 func newTestServer(stepErr error) *Server {
 	return newTestServerWithGateway(stepErr, stubGatewayURL)
@@ -145,6 +159,29 @@ func TestHandleInference_SuccessMapsTo200(t *testing.T) {
 	}
 }
 
+func TestHandleInferenceGeneratesCoordinatorRevisionDecisionID(t *testing.T) {
+	step := &captureRevisionDecisionStep{}
+	gw := gateway.NewWithTransport(&http.Transport{}, stubGatewayURL)
+	srv, err := New(config.ServerConfig{}, pipeline.New([]pipeline.Step{step}), gw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientRequestID = "client-request-id"
+	rec := postInferenceWithRequestID(t, srv, clientRequestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if step.requestID != clientRequestID {
+		t.Fatalf("request ID = %q, want %q", step.requestID, clientRequestID)
+	}
+	if step.revisionDecisionID == "" || step.revisionDecisionID == clientRequestID {
+		t.Fatalf("revision decision ID = %q, want an independent coordinator value", step.revisionDecisionID)
+	}
+	if _, err := uuid.Parse(step.revisionDecisionID); err != nil {
+		t.Fatalf("revision decision ID %q is not a UUID: %v", step.revisionDecisionID, err)
+	}
+}
+
 func TestHandleInference_NullBodyMapsTo400(t *testing.T) {
 	// JSON `null` unmarshals to a nil map without error; reject it before steps
 	// write to the body and panic.
@@ -153,6 +190,102 @@ func TestHandleInference_NullBodyMapsTo400(t *testing.T) {
 	newTestServer(nil).handleInference(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for null body, got %d", rec.Code)
+	}
+}
+
+func TestHandleInference_ResponsesRejectsStatefulFields(t *testing.T) {
+	// Locks in that the handler refuses a Responses request depending on state
+	// it does not keep, before the pipeline sees the body; see
+	// reqcommon.RejectStatefulResponsesFields for the field list.
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "previous_response_id", body: `{"model":"m","input":"hi","previous_response_id":"resp-123"}`},
+		{name: "conversation", body: `{"model":"m","input":"hi","conversation":"conv-1"}`},
+		{name: "background", body: `{"model":"m","input":"hi","background":true}`},
+		{name: "file_id", body: `{"model":"m","input":[{"role":"user","content":[{"type":"input_image","file_id":"file-1"}]}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reached := false
+			p := pipeline.New([]pipeline.Step{stubStep{name: "stub", fn: func(_ context.Context, _ *pipeline.RequestContext) error {
+				reached = true
+				return nil
+			}}})
+			srv, err := New(config.ServerConfig{}, p, gateway.NewWithTransport(&http.Transport{}, stubGatewayURL))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, reqcommon.PathResponses, strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			srv.handleInference(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", rec.Code)
+			}
+			if reached {
+				t.Error("expected the pipeline not to run for a rejected request")
+			}
+		})
+	}
+}
+
+func TestHandleInference_ResponsesAcceptsStatelessRequest(t *testing.T) {
+	// store and background:false carry no state the router has to resolve, so
+	// they reach the pipeline unchanged alongside the rest of the body.
+	var seenBody map[string]any
+	p := pipeline.New([]pipeline.Step{stubStep{name: "stub", fn: func(_ context.Context, rc *pipeline.RequestContext) error {
+		seenBody = rc.Body
+		return nil
+	}}})
+	srv, err := New(config.ServerConfig{}, p, gateway.NewWithTransport(&http.Transport{}, stubGatewayURL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	body := `{"model":"m","input":"hi","store":true,"background":false}`
+	req := httptest.NewRequest(http.MethodPost, reqcommon.PathResponses, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleInference(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if seenBody["store"] != true {
+		t.Errorf("expected store to pass through, got %v", seenBody["store"])
+	}
+	if seenBody["input"] != "hi" {
+		t.Errorf("expected unrelated fields to survive, got input=%v", seenBody["input"])
+	}
+}
+
+func TestHandleInference_ResponsesRejectionScopedToPath(t *testing.T) {
+	// The rejection must not run for other paths: a chat-completions client is
+	// free to send its own store/previous_response_id/background fields (even
+	// if meaningless there) without the coordinator refusing the request.
+	var seenBody map[string]any
+	p := pipeline.New([]pipeline.Step{stubStep{name: "stub", fn: func(_ context.Context, rc *pipeline.RequestContext) error {
+		seenBody = rc.Body
+		return nil
+	}}})
+	srv, err := New(config.ServerConfig{}, p, gateway.NewWithTransport(&http.Transport{}, stubGatewayURL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	body := `{"model":"m","previous_response_id":"resp-123","conversation":"conv-1","store":true,"background":true}`
+	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleInference(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	for _, field := range []string{"previous_response_id", "conversation", "store", "background"} {
+		if _, ok := seenBody[field]; !ok {
+			t.Errorf("expected %q to survive on a non-responses path", field)
+		}
 	}
 }
 
@@ -295,9 +428,10 @@ func TestRoutesRegistered(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{"chat completions", http.MethodPost, gateway.PathChatCompletions, inferenceBody},
-		{"completions", http.MethodPost, gateway.PathCompletions, inferenceBody},
-		{"generate", http.MethodPost, gateway.DefaultGeneratePath, inferenceBody},
+		{"chat completions", http.MethodPost, reqcommon.PathChatCompletions, inferenceBody},
+		{"completions", http.MethodPost, reqcommon.PathCompletions, inferenceBody},
+		{"responses", http.MethodPost, reqcommon.PathResponses, inferenceBody},
+		{"generate", http.MethodPost, reqcommon.PathVLLMGenerate, inferenceBody},
 		{"healthz", http.MethodGet, "/healthz", ""},
 		{"readyz", http.MethodGet, "/readyz", ""},
 	}
@@ -735,10 +869,10 @@ func TestRoutesRegistered_MethodMismatchReturns405(t *testing.T) {
 	// through to the passthrough. Chi's default MethodNotAllowed handler
 	// produces this; the coordinator does not override it.
 	srv := newTestServer(nil)
-	req := httptest.NewRequest(http.MethodGet, gateway.PathChatCompletions, nil)
+	req := httptest.NewRequest(http.MethodGet, reqcommon.PathChatCompletions, nil)
 	rec := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 for GET on POST-only %s, got %d", gateway.PathChatCompletions, rec.Code)
+		t.Fatalf("expected 405 for GET on POST-only %s, got %d", reqcommon.PathChatCompletions, rec.Code)
 	}
 }

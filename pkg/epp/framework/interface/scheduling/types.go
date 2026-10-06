@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -65,6 +66,11 @@ type InferenceRequest struct {
 	// Access via PutAttribute, GetAttribute, AttributeKeys, and ReadRequestAttribute.
 	// A nil pointer is valid; the store is lazily allocated on first write.
 	attributes *sync.Map
+
+	// scope confines attribute access to the keys one plugin declares. Nil on
+	// the request the framework owns, which reaches the store unconfined; set
+	// on the shallow copy WithAttributeScope hands to a plugin.
+	scope AttributeScope
 }
 
 func (r *InferenceRequest) String() string {

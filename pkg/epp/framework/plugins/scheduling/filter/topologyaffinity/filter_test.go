@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -131,8 +131,13 @@ func TestFilter_Consumes(t *testing.T) {
 	consumes := f.Consumes()
 
 	assert.Empty(t, consumes.Required)
-	require.Len(t, consumes.Optional, 1)
+	require.Len(t, consumes.Optional, 2)
 	assert.Equal(t, attrtopology.Topology{}, consumes.Optional[f.dataKey])
+
+	// The peer endpoint the filter compares against is a request attribute; the
+	// filter reads it through topoutil.PeerTopology, so it belongs in Consumes.
+	require.Contains(t, consumes.Optional, disagg.PeerEndpointAttributeKey)
+	assert.Nil(t, consumes.Optional[disagg.PeerEndpointAttributeKey])
 }
 
 func TestFactory_Defaults(t *testing.T) {

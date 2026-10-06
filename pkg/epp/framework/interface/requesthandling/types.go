@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +18,7 @@ limitations under the License.
 package requesthandling
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,7 +48,8 @@ const (
 type RequestPayload interface {
 	isRequestPayload()
 	IsParsed() bool
-	// AsMap returns the parsed JSON map
+	// AsMap returns the JSON envelope. Content may be opaque json.RawMessage;
+	// use the protocol projections to inspect it.
 	AsMap() (PayloadMap, bool)
 }
 
@@ -116,6 +119,12 @@ type InferenceRequestBody struct {
 	// If the payload is unmarshaled, we can perform advanced processing (like prefix cache aware routing).
 	// If it remains as raw bytes, such processing may not be supported.
 	Payload RequestPayload `json:"-"`
+	// RawBody retains the parser's JSON input for rendering: handlers.Request.RawBody
+	// for HTTP, or embedded HttpBody.Data for Vertex AI. Repackaging updates the
+	// handler body while this snapshot remains unchanged.
+	RawBody []byte `json:"-"`
+	// RenderRequest bypasses token production while retaining model routing.
+	RenderRequest bool `json:"-"`
 	// TokenizedRequest contains parser-derived tokenization results when available.
 	// It is nil when the request was not already tokenized.
 	TokenizedRequest *TokenizedRequest `json:"-"`
@@ -141,6 +150,14 @@ type InferenceRequestBody struct {
 	// true themselves; it is not inferred or enforced -- see MutatePayloadMap for the one
 	// in-place-edit case the codebase needs today.
 	Mutated bool
+}
+
+// WirePayload is the body used for both rendering and forwarding.
+func (b *InferenceRequestBody) WirePayload() RequestPayload {
+	if !b.Mutated && b.RawBody != nil {
+		return RawPayload(b.RawBody)
+	}
+	return b.Payload
 }
 
 // MutatePayloadMap edits Payload in place via fn when Payload is a PayloadMap, and marks the
@@ -733,14 +750,19 @@ type Content struct {
 }
 
 type ContentBlock struct {
-	Type       string     `json:"type"`
-	Text       string     `json:"text,omitempty"`
-	ImageURL   ImageBlock `json:"image_url"`
-	InputAudio AudioBlock `json:"input_audio"`
-	VideoURL   VideoBlock `json:"video_url"`
+	Type       string        `json:"type"`
+	Text       string        `json:"text,omitempty"`
+	ImageURL   ImageBlock    `json:"image_url"`
+	AudioURL   AudioURLBlock `json:"audio_url"`
+	InputAudio AudioBlock    `json:"input_audio"`
+	VideoURL   VideoBlock    `json:"video_url"`
 }
 
 type ImageBlock struct {
+	URL string `json:"url,omitempty"`
+}
+
+type AudioURLBlock struct {
 	URL string `json:"url,omitempty"`
 }
 
@@ -753,23 +775,25 @@ type VideoBlock struct {
 	URL string `json:"url,omitempty"`
 }
 
-// UnmarshalJSON allow use both format
+// UnmarshalJSON accepts either a string or an array of content blocks. The first
+// byte selects the format because each json.Unmarshal rescans the whole value,
+// which is costly for content blocks carrying base64 media.
 func (mc *Content) UnmarshalJSON(data []byte) error {
-	// Raw format
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		mc.Raw = str
-		return nil
-	}
-
-	// Block format
-	var blocks []ContentBlock
-	if err := json.Unmarshal(data, &blocks); err == nil {
+	if trimmed := bytes.TrimLeft(data, " \t\r\n"); len(trimmed) > 0 && trimmed[0] == '[' {
+		var blocks []ContentBlock
+		if err := json.Unmarshal(data, &blocks); err != nil {
+			return errors.New("content format not supported")
+		}
 		mc.Structured = blocks
 		return nil
 	}
 
-	return errors.New("content format not supported")
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return errors.New("content format not supported")
+	}
+	mc.Raw = str
+	return nil
 }
 
 func (mc Content) MarshalJSON() ([]byte, error) {

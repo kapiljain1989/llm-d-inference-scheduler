@@ -33,13 +33,23 @@ import (
 )
 
 const (
-	defaultInMemoryIndexSize = 1e8 // TODO: change to memory-size based configuration
-	defaultPodsPerKey        = 10  // number of pods per key
+	// defaultInMemoryIndexSize caps the index by entry count, not memory: the
+	// underlying LRU evicts on count and has no notion of byte cost. To size
+	// Size against available memory, estimate per-entry cost as roughly
+	// PodCacheSize pod entries times the PodIdentifier and DeviceTier string
+	// lengths, plus map/LRU bookkeeping overhead, and divide the memory budget
+	// by that. CostAwareMemoryIndex tracks actual byte cost per entry and
+	// evicts against a configured memory budget directly; prefer it when the
+	// workload's per-entry size is hard to predict up front.
+	defaultInMemoryIndexSize = 1e8
+	defaultPodsPerKey        = 10 // number of pods per key
 )
 
 // InMemoryIndexConfig holds the configuration for the InMemoryIndex.
 type InMemoryIndexConfig struct {
-	// Size is the maximum number of keys that can be stored in the index.
+	// Size is the maximum number of keys that can be stored in the index. It
+	// bounds entry count, not memory; see defaultInMemoryIndexSize for sizing
+	// it against available memory.
 	Size int `json:"size"`
 	// PodCacheSize is the maximum number of pod entries per key.
 	// A non-positive value selects defaultPodsPerKey.
@@ -407,7 +417,7 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 
 	switch keyType {
 	case EngineKey:
-		rks, found := m.engineToRequestKeys.Get(key)
+		rks, found := m.engineToRequestKeys.Peek(key)
 		if !found {
 			traceLogger.Info("engineKey not found in mapping, nothing to evict", "engineKey", key)
 			return nil
@@ -420,7 +430,7 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 		m.mu.Lock()
 		allEmpty := true
 		for _, rk := range rks {
-			if pc, found := m.data.Get(rk); found && pc != nil && pc.size() > 0 {
+			if pc, found := m.data.Peek(rk); found && pc != nil && pc.size() > 0 {
 				allEmpty = false
 				break
 			}
@@ -441,7 +451,7 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 // evictPodsFromRequestKey removes the given pod entries from a single request key's cache.
 // If the cache becomes empty, the request key is removed from the index.
 func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash, entries []PodEntry, traceLogger logr.Logger) {
-	podCache, found := m.data.Get(requestKey)
+	podCache, found := m.data.Peek(requestKey)
 	if !found || podCache == nil {
 		traceLogger.Info("requestKey not found in index, nothing to evict", "requestKey", requestKey, "engineKey", engineKey)
 		return
@@ -457,7 +467,7 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 
 	// Remove key from main cache if empty.
 	// Re-fetch and hold the lock through removal to prevent racing with Add.
-	currentCache, stillExists := m.data.Get(requestKey)
+	currentCache, stillExists := m.data.Peek(requestKey)
 	if !stillExists || currentCache == nil {
 		return
 	}

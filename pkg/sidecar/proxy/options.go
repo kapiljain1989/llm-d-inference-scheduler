@@ -37,6 +37,7 @@ import (
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 	"sigs.k8s.io/yaml"
 )
 
@@ -54,45 +55,48 @@ const (
 	MoRIIOFeatureEnabled = true
 
 	// Flags
-	port                            = "port"
-	modelServerPort                 = "model-server-port"
-	vllmPort                        = "vllm-port"
-	dataParallelSize                = "data-parallel-size"
-	kvConnector                     = "kv-connector"
-	ecConnector                     = "ec-connector"
-	mooncakeBootstrapPortFlag       = "mooncake-bootstrap-port"
-	p2pConnectorPortFlag            = "p2p-connector-port"
-	enableP2PPull                   = "enable-p2p-pull"
-	enableSSRFProtection            = "enable-ssrf-protection"
-	enablePrefillerSampling         = "enable-prefiller-sampling"
-	enableTLS                       = "enable-tls"
-	tlsInsecureSkipVerify           = "tls-insecure-skip-verify"
-	tlsMinVersion                   = "tls-min-version"
-	tlsCipherSuites                 = "tls-cipher-suites"
-	secureServing                   = "secure-proxy"
-	certPath                        = "cert-path"
-	inferencePool                   = "inference-pool"
-	poolGroup                       = "pool-group"
-	maxIdleConnsPerHost             = "max-idle-conns-per-host"
-	prefillMaxRetries               = "prefill-max-retries"
-	prefillRetryBackoff             = "prefill-retry-backoff"
-	decodeChunkSize                 = "decode-chunk-size"
-	inlineConfiguration             = "configuration"
-	configurationFile               = "configuration-file"
-	tracingFlag                     = "tracing"
-	metricsPort                     = "metrics-port"
-	metricsCertDir                  = "metrics-cert-dir"
-	enableBidirectionalKVXfer       = "enable-bidirectional-kv-xfer"
-	bidirectionalSessionHeader      = "bidirectional-session-header"
-	bidirectionalCacheSize          = "bidirectional-cache-size"
-	bidirectionalCacheTTL           = "bidirectional-cache-ttl"
-	bidirectionalRecomputeThreshold = "bidirectional-recompute-threshold"
+	port                      = "port"
+	modelServerPort           = "model-server-port"
+	vllmPort                  = "vllm-port"
+	dataParallelSize          = "data-parallel-size"
+	kvConnector               = "kv-connector"
+	ecConnector               = "ec-connector"
+	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
+	p2pConnectorPortFlag      = "p2p-connector-port"
+	enableP2PPull             = "enable-p2p-pull"
+	enableSSRFProtection      = "enable-ssrf-protection"
+	enablePrefillerSampling   = "enable-prefiller-sampling"
+	enableTLS                 = "enable-tls"
+	tlsInsecureSkipVerify     = "tls-insecure-skip-verify"
+	tlsMinVersion             = "tls-min-version"
+	tlsCipherSuites           = "tls-cipher-suites"
+	secureServing             = "secure-serving"
+	secureProxy               = "secure-proxy"
+	certPath                  = "cert-path"
+	inferencePool             = "inference-pool"
+	poolGroup                 = "pool-group"
+	maxIdleConnsPerHost       = "max-idle-conns-per-host"
+	prefillMaxRetries         = "prefill-max-retries"
+	prefillRetryBackoff       = "prefill-retry-backoff"
+	decodeChunkSize           = "decode-chunk-size"
+	inlineConfiguration       = "configuration"
+	configurationFile         = "configuration-file"
+	tracingFlag               = "tracing"
+	metricsPort               = "metrics-port"
+	metricsCertDir            = "metrics-cert-dir"
+
+	enableBidirectionalKVXfer  = "enable-bidirectional-kv-xfer"
+	bidirectionalSessionHeader = "bidirectional-session-header"
+	bidirectionalCacheSize     = "bidirectional-cache-size"
+	bidirectionalCacheTTL      = "bidirectional-cache-ttl"
 
 	// Environment variables
 	envInferencePool           = "INFERENCE_POOL"
 	envEnablePrefillerSampling = "ENABLE_PREFILLER_SAMPLING"
 	envMooncakeBootstrapPort   = "MOONCAKE_BOOTSTRAP_PORT"
 	envP2PConnectorPort        = "P2P_CONNECTOR_PORT"
+	envPodName                 = "POD_NAME"
+	envPodNamespace            = "POD_NAMESPACE"
 
 	// Defaults
 	defaultPort                  = "8000"
@@ -101,8 +105,14 @@ const (
 	defaultMooncakeBootstrapPort = 8998
 	defaultP2PConnectorPort      = 7777
 
+	// defaultBidirectionalSessionHeader is the EPP session-affinity plugin's default header.
+	defaultBidirectionalSessionHeader = "x-session-token"
+	defaultBidirectionalCacheSize     = 4096
+	// defaultBidirectionalCacheTTL is vLLM's default decoder_kv_blocks_ttl.
+	defaultBidirectionalCacheTTL = 480 * time.Second
+
 	// defaultMoRIIOParallelDecodeWaitTimeout backstops the parallel WRITE
-	// dispatch: it bounds how long the decode leg waits on the prefill outcome
+	// dispatch: it bounds how long the decode request waits on the prefill outcome
 	// (and thus KV) before being cancelled, so a hung/failed prefill fails the
 	// request instead of hanging. Prefill in parallel dispatch is capped to one
 	// token, so it normally resolves well within this window.
@@ -127,7 +137,8 @@ type yamlConfiguration struct {
 	EnableSSRFProtection    *bool    `json:"enable-ssrf-protection,omitempty"`
 	EnablePrefillerSampling *bool    `json:"enable-prefiller-sampling,omitempty"`
 	EnableP2PPull           *bool    `json:"enable-p2p-pull,omitempty"`
-	SecureServing           *bool    `json:"secure-proxy,omitempty"`
+	SecureServing           *bool    `json:"secure-serving,omitempty"`
+	SecureProxy             *bool    `json:"secure-proxy,omitempty"`
 	CertPath                string   `json:"cert-path,omitempty"`
 	EnableTLS               []string `json:"enable-tls,omitempty"`
 	TLSInsecureSkipVerify   []string `json:"tls-insecure-skip-verify,omitempty"`
@@ -175,17 +186,17 @@ type Options struct {
 var (
 	// supportedKVConnectors defines all valid P/D KV connector types
 	supportedKVConnectors = map[string]struct{}{
-		KVConnectorNIXLV2:        {},
-		KVConnectorSharedStorage: {},
-		KVConnectorSGLang:        {},
-		KVConnectorMooncake:      {},
-		KVConnectorOffloading:    {},
+		constants.KVConnectorNIXLV2:        {},
+		constants.KVConnectorSharedStorage: {},
+		constants.KVConnectorSGLang:        {},
+		constants.KVConnectorMooncake:      {},
+		constants.KVConnectorOffloading:    {},
 	}
 
 	// supportedECConnectors defines all valid E/P EC connector types
 	supportedECConnectors = map[string]struct{}{
-		ECExampleConnector: {},
-		ECConnectorNIXL:    {},
+		constants.ECExampleConnector: {},
+		constants.ECConnectorNIXL:    {},
 	}
 
 	// supportedTLSStages defines all valid stages for TLS configuration
@@ -195,8 +206,8 @@ var (
 		encodeStage:  {},
 	}
 
-	supportedKVConnectorNamesStr = strings.Join([]string{KVConnectorNIXLV2, KVConnectorSharedStorage, KVConnectorSGLang, KVConnectorMooncake, KVConnectorOffloading}, ", ")
-	supportedECConnectorNamesStr = strings.Join([]string{ECExampleConnector, ECConnectorNIXL}, ", ")
+	supportedKVConnectorNamesStr = strings.Join([]string{constants.KVConnectorNIXLV2, constants.KVConnectorSharedStorage, constants.KVConnectorSGLang, constants.KVConnectorMooncake, constants.KVConnectorOffloading}, ", ")
+	supportedECConnectorNamesStr = strings.Join([]string{constants.ECExampleConnector, constants.ECConnectorNIXL}, ", ")
 
 	supportedTLSStageNamesStr = strings.Join([]string{prefillStage, decodeStage, encodeStage}, ", ")
 )
@@ -225,7 +236,7 @@ func NewOptions() *Options {
 	return &Options{
 		Config: Config{
 			Port:                    defaultPort,
-			KVConnector:             KVConnectorNIXLV2,
+			KVConnector:             constants.KVConnectorNIXLV2,
 			DataParallelSize:        defaultDataParallelSize,
 			SecureServing:           true,
 			EnablePrefillerSampling: enablePrefillerSampling,
@@ -255,12 +266,11 @@ func NewOptions() *Options {
 			MoRIIODPSizeLocal: 0,
 			MoRIIODecodeHosts: nil,
 
-			// Bidirectional KV transfer defaults: off, preserving existing behavior.
-			BidirectionalKVXfer:             false,
-			BidirectionalSessionHeader:      "x-session-token",
-			BidirectionalCacheSize:          4096,
-			BidirectionalCacheTTL:           480 * time.Second,
-			BidirectionalRecomputeThreshold: 64,
+			BidirectionalSessionHeader: defaultBidirectionalSessionHeader,
+			BidirectionalCacheSize:     defaultBidirectionalCacheSize,
+			BidirectionalCacheTTL:      defaultBidirectionalCacheTTL,
+			PodName:                    os.Getenv(envPodName),
+			PodNamespace:               os.Getenv(envPodNamespace),
 		},
 		vllmPort:      defaultVLLMPort,
 		inferencePool: os.Getenv(envInferencePool),
@@ -291,18 +301,31 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.MooncakeBootstrapPort, mooncakeBootstrapPortFlag, opts.MooncakeBootstrapPort,
 		"the port used to query the Mooncake bootstrap endpoint on prefill pods (only used with --kv-connector=mooncake)")
 	fs.IntVar(&opts.P2PConnectorPort, p2pConnectorPortFlag, opts.P2PConnectorPort,
-		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode leg; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
+		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode request; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
 	fs.BoolVar(&opts.EnableP2PPull, enableP2PPull, opts.EnableP2PPull,
 		"declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXL, i.e. engines run MultiConnector(NixlConnector + OffloadingConnector). Rejected with any other --kv-connector; offloading provides the tier natively without this flag.")
-	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Enables secure proxy. Defaults to true.")
-	fs.StringVar(&opts.CertPath, certPath, opts.CertPath, "The path to the certificate for secure proxy. The certificate and private key files are assumed to be named tls.crt and tls.key, respectively. If not set, and secureProxy is enabled, then a self-signed certificate is used (for testing).")
+	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Serve the listener over TLS.")
+	fs.BoolVar(&opts.SecureServing, secureProxy, opts.SecureServing, "Deprecated: use --secure-serving instead.")
+	_ = fs.MarkDeprecated(secureProxy, "use --secure-serving instead")
+	fs.StringVar(&opts.CertPath, certPath, opts.CertPath, "Directory with tls.crt and tls.key for secure serving. Empty generates a self-signed certificate, which is only suitable for testing.")
 	fs.BoolVar(&opts.EnableSSRFProtection, enableSSRFProtection, opts.EnableSSRFProtection, "enable SSRF protection using InferencePool allowlisting")
 	fs.BoolVar(&opts.EnablePrefillerSampling, enablePrefillerSampling, opts.EnablePrefillerSampling, "if true, the target prefill instance will be selected randomly from among the provided prefill host values")
 	fs.StringVar(&opts.PoolGroup, poolGroup, opts.PoolGroup, "group of the InferencePool this Endpoint Picker is associated with.")
 	fs.IntVar(&opts.DecodeChunkSize, decodeChunkSize, opts.DecodeChunkSize, "enables chunked decode mode when > 0; value is the token budget per chunk. For best performance should be a multiple of the block size.")
 	fs.BoolVar(&opts.Tracing, tracingFlag, opts.Tracing, "Enable OpenTelemetry tracing")
-	fs.IntVar(&opts.MetricsPort, metricsPort, opts.MetricsPort, "Port for the Prometheus /metrics endpoint (exposes the moriio_dns_* counters). 0 (the default) disables it. Takes precedence over the MORIIO_METRICS_ADDR env var.")
-	fs.StringVar(&opts.MetricsCertDir, metricsCertDir, opts.MetricsCertDir, "Directory with tls.crt and tls.key for the metrics endpoint. Empty (the default) serves metrics over plain HTTP. Independent of --secure-proxy/--cert-path, which apply to the data-plane listener.")
+	fs.IntVar(&opts.MetricsPort, metricsPort, opts.MetricsPort, "Port for the Prometheus /metrics endpoint (exposes the moriio_dns_* and llm_d_disagg_sidecar_* counters). 0 (the default) disables it. Takes precedence over the MORIIO_METRICS_ADDR env var.")
+	fs.StringVar(&opts.MetricsCertDir, metricsCertDir, opts.MetricsCertDir, "Directory with tls.crt and tls.key for the metrics endpoint. Empty serves metrics over plain HTTP. Independent of --secure-serving and --cert-path, which apply to the serving listener.")
+
+	fs.BoolVar(&opts.BidirectionalKVXfer, enableBidirectionalKVXfer, opts.BidirectionalKVXfer,
+		"let the prefill engine read a conversation's KV blocks from the decode engine that served its previous turn instead of recomputing the history. "+
+			"Applies to Chat Completions with --kv-connector=nixlv2 against engines running NIXL with bidirectional_kv_xfer. "+
+			"Requires POD_NAME and POD_NAMESPACE (downward API) and the EPP session-affinity encoded-endpoint token on requests. See docs/disaggregation.md.")
+	fs.StringVar(&opts.BidirectionalSessionHeader, bidirectionalSessionHeader, opts.BidirectionalSessionHeader,
+		"request header carrying the EPP session token; must match the session-affinity plugin's header (only used with --enable-bidirectional-kv-xfer)")
+	fs.IntVar(&opts.BidirectionalCacheSize, bidirectionalCacheSize, opts.BidirectionalCacheSize,
+		"maximum number of conversation turns whose decode-side KV blocks are kept for a follow-up request (only used with --enable-bidirectional-kv-xfer)")
+	fs.DurationVar(&opts.BidirectionalCacheTTL, bidirectionalCacheTTL, opts.BidirectionalCacheTTL,
+		"how long a conversation turn's decode-side KV blocks stay usable; must not exceed the engine's decoder_kv_blocks_ttl (only used with --enable-bidirectional-kv-xfer)")
 
 	// MoRI-IO WRITE-mode flags. Only meaningful with --kv-connector=nixlv2
 	// against vLLM engines running MoRI-IO in WRITE mode.
@@ -311,7 +334,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.MoRIIODecodeNotifyPort, "moriio-decode-notify-port", opts.MoRIIODecodeNotifyPort,
 		"Base MoRI-IO notify port on the decode pod.")
 	fs.StringVar(&opts.MoRIIODecodePodIP, "moriio-local-pod-ip", opts.MoRIIODecodePodIP,
-		"Decode pod's routable address, used as the prefill leg's remote_host. "+
+		"Decode pod's routable address, used as the prefill request's remote_host. "+
 			"A Kubernetes DNS name (e.g., 'pod-name.namespace.svc.cluster.local') "+
 			"is resolved to an IP at startup; a literal IP is used as-is. "+
 			"Defaults to the POD_IP env var. Required with --moriio-write-mode.")
@@ -325,18 +348,18 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&opts.MoRIIOParallelDecodeWaitTimeout, "moriio-parallel-decode-wait-timeout", opts.MoRIIOParallelDecodeWaitTimeout,
 		"Backstop timeout for parallel dispatch: how long decode may wait on the prefill outcome/KV before being cancelled so the request fails instead of hanging. Only used with --moriio-parallel-dispatch.")
 	fs.IntVar(&opts.MoRIIOPrefillHandshakePort, "moriio-prefill-handshake-port", opts.MoRIIOPrefillHandshakePort,
-		"Prefill pod's base MoRI-IO handshake port, used to build the decode leg in parallel-dispatch mode.")
+		"Prefill pod's base MoRI-IO handshake port, used to build the decode request in parallel-dispatch mode.")
 	fs.IntVar(&opts.MoRIIOPrefillNotifyPort, "moriio-prefill-notify-port", opts.MoRIIOPrefillNotifyPort,
 		"Prefill pod's base MoRI-IO notify port.")
 	fs.IntVar(&opts.MoRIIOTPSize, "moriio-tp-size", opts.MoRIIOTPSize,
 		"Tensor-parallel size of the engines, echoed into kv_transfer_params[tp_size].")
 	fs.IntVar(&opts.MoRIIODPSize, "moriio-dp-size", opts.MoRIIODPSize,
-		"Data-parallel world size, emitted as kv_transfer_params[remote_dp_size] on both legs. "+
+		"Data-parallel world size, emitted as kv_transfer_params[remote_dp_size] on both requests. "+
 			"Set to the engine DP size for Wide-EP (TP=1, DP>1); default 1 leaves the wire unchanged.")
 
 	// Wide-EP multi-pod fan-out. Optional: empty preserves single-pod behaviour.
 	// remote_hosts carries the opposite side's pod DNS names (decode on the prefill
-	// leg and vice versa); dp-size-local maps a global DP rank to a pod via
+	// request and vice versa); dp-size-local maps a global DP rank to a pod via
 	// pod_idx = dp_rank / dp_size_local.
 	// DNS names are resolved to IPs at startup (LWS-compatible).
 	fs.StringSliceVar(&opts.MoRIIORemoteHosts, "moriio-remote-hosts", opts.MoRIIORemoteHosts,
@@ -348,43 +371,17 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Wide-EP: per-pod DP size used to map a global DP rank to a pod index. "+
 			"Must satisfy --moriio-dp-size = dp-size-local * len(hosts).")
 	fs.StringSliceVar(&opts.MoRIIODecodeHosts, "moriio-decode-hosts", opts.MoRIIODecodeHosts,
-		"Wide-EP: comma-separated decode-side pod hosts, emitted as the prefill leg's "+
+		"Wide-EP: comma-separated decode-side pod hosts, emitted as the prefill request's "+
 			"remote_hosts. Kubernetes DNS names (e.g., 'pod-name.namespace.svc.cluster.local') "+
 			"are resolved to IPs at startup; literal IPs are used as-is. "+
 			"Pair with --moriio-dp-size-local.")
 
-	// Bidirectional KV transfer flags. Only meaningful with --kv-connector=nixlv2.
-	fs.BoolVar(&opts.BidirectionalKVXfer, enableBidirectionalKVXfer, opts.BidirectionalKVXfer,
-		"Enable bidirectional KV cache transfer for multi-turn agentic workloads. "+
-			"Caches kv_transfer_params from decode responses and injects them into "+
-			"subsequent prefill requests for the same session, allowing prefill to pull "+
-			"existing KV from decode via NIXL RDMA instead of recomputing the full "+
-			"conversation history. Requires --kv-connector=nixlv2. Session tokens must "+
-			"be EPP-issued (validates token matches current pod hostname).")
-	fs.StringVar(&opts.BidirectionalSessionHeader, bidirectionalSessionHeader, opts.BidirectionalSessionHeader,
-		"HTTP request header carrying the EPP-issued session identifier used as cache key. "+
-			"EPP's session affinity plugin auto-generates this token (e.g., base64(pod_name)) "+
-			"and echoes it in response headers.")
-	fs.IntVar(&opts.BidirectionalCacheSize, bidirectionalCacheSize, opts.BidirectionalCacheSize,
-		"Maximum number of sessions in the per-sidecar kv_transfer_params cache. "+
-			"Size based on decode pool KV capacity, not request volume. Example: "+
-			"Llama-3.3-70B at 70K tokens per session requires approximately 23GB KV per "+
-			"session; an 8-GPU decode pod holds roughly 15-25 concurrent sessions.")
-	fs.DurationVar(&opts.BidirectionalCacheTTL, bidirectionalCacheTTL, opts.BidirectionalCacheTTL,
-		"Cache entry TTL, aligned with vLLM's decoder_kv_blocks_ttl so cached params "+
-			"expire when the engine evicts its KV blocks.")
-	fs.IntVar(&opts.BidirectionalRecomputeThreshold, bidirectionalRecomputeThreshold, opts.BidirectionalRecomputeThreshold,
-		"Minimum number of remote tokens required to trigger a D to P pull. Below this, "+
-			"prefill recomputes locally to amortize transfer latency. Note: the vLLM "+
-			"engine also enforces its own kv_recompute_threshold; both should be set to "+
-			"the same value for expected behavior.")
-
 	fs.StringSliceVar(&opts.enableTLS, enableTLS, opts.enableTLS, "stages to enable TLS for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
 	fs.StringSliceVar(&opts.tlsInsecureSkipVerify, tlsInsecureSkipVerify, opts.tlsInsecureSkipVerify, "stages to skip TLS verification for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
 	fs.StringVar(&opts.tlsMinVersion, tlsMinVersion, opts.tlsMinVersion,
-		"minimum TLS version for secure proxy (e.g., VersionTLS12, VersionTLS13)")
+		"Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13). Empty uses VersionTLS12.")
 	fs.StringSliceVar(&opts.tlsCipherSuites, tlsCipherSuites, opts.tlsCipherSuites,
-		"comma-separated list of TLS cipher suites for secure proxy (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable")
+		"Comma-separated list of TLS cipher suites for secure serving (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Empty uses the crypto/tls default. Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable.")
 	fs.StringVar(&opts.inferencePool, inferencePool, opts.inferencePool, "InferencePool in namespace/name or name format (e.g., default/my-pool or my-pool). A single name implies the 'default' namespace. Can also use INFERENCE_POOL env var.")
 
 	fs.IntVar(&opts.MaxIdleConnsPerHost, "max-idle-conns-per-host", opts.MaxIdleConnsPerHost, "max idle keep-alive connections per host for reverse proxy transports; set to at least the expected concurrency")
@@ -412,10 +409,14 @@ var tlsVersions = map[string]uint16{
 }
 
 func parseTLSVersion(version string) (uint16, error) {
-	if value, ok := tlsVersions[version]; ok {
-		return value, nil
+	value, ok := tlsVersions[version]
+	if !ok {
+		return 0, fmt.Errorf("unknown TLS version %q; supported values: VersionTLS12, VersionTLS13", version)
 	}
-	return 0, fmt.Errorf("unknown TLS version %q; supported values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13", version)
+	if value < tls.VersionTLS12 {
+		return 0, fmt.Errorf("tls-min-version %q is below the TLS 1.2 minimum; supported values: VersionTLS12, VersionTLS13", version)
+	}
+	return value, nil
 }
 
 func parseCipherSuites(names []string) ([]uint16, error) {
@@ -529,7 +530,7 @@ func (opts *Options) Complete() error {
 		return errors.New("--moriio-parallel-dispatch requires --moriio-write-mode")
 	}
 
-	// Both legs share the same dp_size / dp_size_local contract; only the host
+	// Both requests share the same dp_size / dp_size_local contract; only the host
 	// list differs.
 	if err := validateWideEPHosts(
 		"--moriio-remote-hosts", opts.MoRIIORemoteHosts,
@@ -567,7 +568,7 @@ func (opts *Options) Complete() error {
 	opts.MoRIIODecodeHosts = resolvedDecode
 
 	// Single-host counterpart: --moriio-local-pod-ip is decode's advertised
-	// remote_host on the prefill leg. Resolve it the same way so it can be an
+	// remote_host on the prefill request. Resolve it the same way so it can be an
 	// LWS DNS name (a literal IP passes through unchanged).
 	if opts.MoRIIODecodePodIP != "" {
 		resolved, podIPErr := resolveHostsToIPs([]string{opts.MoRIIODecodePodIP})
@@ -575,19 +576,6 @@ func (opts *Options) Complete() error {
 			return fmt.Errorf("resolving --moriio-local-pod-ip: %w", podIPErr)
 		}
 		opts.MoRIIODecodePodIP = resolved[0]
-	}
-
-	// Populate PodIdentity for session token validation in bidirectional KV transfer.
-	// EPP's encoded_endpoint_header strategy generates tokens as base64(namespace/pod_name).
-	// We validate tokens by decoding and comparing to our own namespace/pod_name identity,
-	// preventing clients from hijacking other pods' cached KV params via cross-pod tokens.
-	if opts.BidirectionalKVXfer {
-		namespace := os.Getenv("POD_NAMESPACE")
-		podName := os.Getenv("POD_NAME")
-		if namespace == "" || podName == "" {
-			return fmt.Errorf("bidirectional KV transfer requires POD_NAMESPACE and POD_NAME env vars (use Kubernetes downward API)")
-		}
-		opts.PodHostname = namespace + "/" + podName
 	}
 
 	return nil
@@ -775,33 +763,38 @@ func (opts *Options) Validate() error {
 	// --enable-p2p-pull composes the OffloadingConnector P2P tier alongside NIXL
 	// via MultiConnector; it is only meaningful with the NIXLv2 PD connector.
 	// offloading already provides the tier natively and needs no flag.
-	if opts.EnableP2PPull && opts.KVConnector != KVConnectorNIXLV2 {
-		return fmt.Errorf("--enable-p2p-pull requires --kv-connector=%s (got %q)", KVConnectorNIXLV2, opts.KVConnector)
+	if opts.EnableP2PPull && opts.KVConnector != constants.KVConnectorNIXLV2 {
+		return fmt.Errorf("--enable-p2p-pull requires --kv-connector=%s (got %q)", constants.KVConnectorNIXLV2, opts.KVConnector)
+	}
+
+	if opts.BidirectionalKVXfer {
+		if opts.KVConnector != constants.KVConnectorNIXLV2 {
+			return fmt.Errorf("--%s requires --%s=%s (got %q)", enableBidirectionalKVXfer, kvConnector, constants.KVConnectorNIXLV2, opts.KVConnector)
+		}
+		if opts.MoRIIOWriteMode {
+			return fmt.Errorf("--%s is not supported with --moriio-write-mode", enableBidirectionalKVXfer)
+		}
+		if opts.DecodeChunkSize > 0 {
+			return fmt.Errorf("--%s is not supported with --%s", enableBidirectionalKVXfer, decodeChunkSize)
+		}
+		if opts.PodName == "" || opts.PodNamespace == "" {
+			return fmt.Errorf("--%s requires the %s and %s environment variables (Kubernetes downward API)", enableBidirectionalKVXfer, envPodName, envPodNamespace)
+		}
+		if opts.BidirectionalSessionHeader == "" {
+			return fmt.Errorf("--%s must not be empty", bidirectionalSessionHeader)
+		}
+		if opts.BidirectionalCacheSize <= 0 {
+			return fmt.Errorf("--%s must be positive, got %d", bidirectionalCacheSize, opts.BidirectionalCacheSize)
+		}
+		if opts.BidirectionalCacheTTL <= 0 {
+			return fmt.Errorf("--%s must be positive, got %v", bidirectionalCacheTTL, opts.BidirectionalCacheTTL)
+		}
 	}
 
 	// Validate SSRF protection requirements
 	if opts.EnableSSRFProtection {
 		if opts.InferencePoolNamespace == "" || opts.InferencePoolName == "" {
 			return errors.New("--inference-pool flag or INFERENCE_POOL environment variable is required when --enable-ssrf-protection is true")
-		}
-	}
-
-	// Validate bidirectional KV transfer configuration
-	if opts.BidirectionalKVXfer {
-		if opts.KVConnector != KVConnectorNIXLV2 {
-			return fmt.Errorf("--enable-bidirectional-kv-xfer requires --kv-connector=%s (got %q)", KVConnectorNIXLV2, opts.KVConnector)
-		}
-		if opts.BidirectionalCacheSize <= 0 {
-			return fmt.Errorf("--bidirectional-cache-size must be positive, got %d", opts.BidirectionalCacheSize)
-		}
-		if opts.BidirectionalCacheTTL <= 0 {
-			return fmt.Errorf("--bidirectional-cache-ttl must be positive, got %v", opts.BidirectionalCacheTTL)
-		}
-		if opts.BidirectionalRecomputeThreshold < 0 {
-			return fmt.Errorf("--bidirectional-recompute-threshold must be non-negative, got %d", opts.BidirectionalRecomputeThreshold)
-		}
-		if opts.BidirectionalSessionHeader == "" {
-			return errors.New("--bidirectional-session-header cannot be empty")
 		}
 	}
 
@@ -913,8 +906,13 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 		opts.EnableP2PPull = *cfg.EnableP2PPull
 	}
 
-	if cfg.SecureServing != nil && !opts.isFlagSet(secureServing) {
-		opts.SecureServing = *cfg.SecureServing
+	if !opts.isSecureServingFlagSet() {
+		switch {
+		case cfg.SecureServing != nil:
+			opts.SecureServing = *cfg.SecureServing
+		case cfg.SecureProxy != nil:
+			opts.SecureServing = *cfg.SecureProxy
+		}
 	}
 	if cfg.CertPath != "" && !opts.isFlagSet(certPath) {
 		opts.CertPath = cfg.CertPath
@@ -963,6 +961,10 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	if cfg.Tracing != nil && !opts.isFlagSet(tracingFlag) {
 		opts.Tracing = *cfg.Tracing
 	}
+}
+
+func (opts *Options) isSecureServingFlagSet() bool {
+	return opts.isFlagSet(secureServing) || opts.isFlagSet(secureProxy)
 }
 
 // isFlagSet returns true if flag was set by user

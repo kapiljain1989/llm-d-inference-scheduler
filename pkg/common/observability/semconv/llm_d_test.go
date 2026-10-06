@@ -178,6 +178,12 @@ func TestLLMDSemanticConventions(t *testing.T) {
 			wantKey:  "llm_d.epp.profile_handler.decode_failed",
 			wantType: attribute.BOOL,
 		},
+		{
+			name:     "LLMDEPPProfileHandlerPrefillFailed",
+			got:      LLMDEPPProfileHandlerPrefillFailed(true),
+			wantKey:  "llm_d.epp.profile_handler.prefill_failed",
+			wantType: attribute.BOOL,
+		},
 
 		// EPP Disagg
 		{
@@ -701,6 +707,20 @@ func TestLLMDSemanticConventions(t *testing.T) {
 			got:      LLMDECProxyEncoderCandidates(4),
 			wantKey:  "llm_d.ec_proxy.encoder_candidates",
 			wantType: attribute.INT64,
+		},
+
+		// Coordinator pipeline
+		{
+			name:     "LLMDCoordinatorPipelineStepCount",
+			got:      LLMDCoordinatorPipelineStepCount(4),
+			wantKey:  "llm_d.coordinator.pipeline.step_count",
+			wantType: attribute.INT64,
+		},
+		{
+			name:     "LLMDCoordinatorPipelineExecutionPath",
+			got:      LLMDCoordinatorPipelineExecutionPath("encode-prefill-decode"),
+			wantKey:  "llm_d.coordinator.pipeline.execution_path",
+			wantType: attribute.STRING,
 		},
 
 		// OpenAI API

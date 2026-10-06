@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,12 +46,17 @@ func TestIsSystemOwnedHeaderIncludesAliases(t *testing.T) {
 		metadata.VideoFPSHeaderKey,
 		metadata.VideoDurationHeaderKey,
 		metadata.VideoResolutionHeaderKey,
+		metadata.AudioDurationHeaderKey,
+		metadata.AudioBytesPerSecondHeaderKey,
 		reqcommon.RevisionDecisionIDHeaderKey,
 		metadata.DestinationEndpointKey,
 		metadata.DestinationEndpointServedKey,
 		metadata.FlowQueueDurationHeaderKey,
 		errcommon.RequestDroppedReasonHeaderKey,
 		"Content-Length",
+		"traceparent",
+		"tracestate",
+		"baggage",
 	}
 
 	for _, header := range systemHeaders {

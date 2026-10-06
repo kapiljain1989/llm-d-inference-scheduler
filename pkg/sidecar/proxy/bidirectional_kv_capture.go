@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,173 +24,267 @@ import (
 	"strings"
 
 	"github.com/felixge/httpsnoop"
+
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
-// kvTransferParamsCapture intercepts decode responses to extract kv_transfer_params
-// without modifying the response body. Supports both non-streaming and SSE modes.
-type kvTransferParamsCapture struct {
-	header         http.Header
-	wroteHeader    bool
-	streaming      bool
-	streamBuffer   []byte
-	capturedParams map[string]any
-	bodyBuffer     []byte
+// maxCapturedResponseBytes bounds what the capture keeps of one decode response.
+// A larger response is forwarded unchanged and never cached.
+const maxCapturedResponseBytes = 16 << 20
+
+// decodeCapture observes a Chat Completions decode response while it streams to
+// the client and records what bidirectional KV transfer needs from it: the
+// decode engine's kv_transfer_params and the assistant message it generated.
+// Bytes are forwarded untouched and unbuffered, so SSE keeps flowing.
+type decodeCapture struct {
+	header http.Header
+
+	started  bool
+	sse      bool
+	body     bytes.Buffer // non-streaming JSON body
+	pending  []byte       // SSE bytes after the last newline
+	overflow bool
+	// unusable is set when the response cannot be reduced to one assistant
+	// message: more than one choice, or a data frame that does not parse.
+	unusable bool
+
+	kvParams map[string]any
+	content  strings.Builder
+	calls    []*capturedToolCall
+	callByIx map[int]*capturedToolCall
 }
 
-const kvTransferParamsField = "kv_transfer_params"
+// capturedToolCall is a tool call, or a fragment of one in a stream. index is
+// the fragment's slot in a stream and -1 when the wire form carries none.
+type capturedToolCall struct {
+	index               int
+	id, name, arguments string
+}
 
-// newKVTransferParamsCaptureWriter wraps the http.ResponseWriter to intercept
-// kv_transfer_params from the decode response. Returns the wrapped writer and
-// a finalize function that returns the captured params (or nil if none found).
-func newKVTransferParamsCaptureWriter(w http.ResponseWriter) (http.ResponseWriter, func() map[string]any) {
-	capture := &kvTransferParamsCapture{
-		header: w.Header(),
+// capturedResponse is the subset of a Chat Completions response or stream
+// chunk that the capture reads.
+type capturedResponse struct {
+	KVTransferParams map[string]any   `json:"kv_transfer_params"`
+	Choices          []capturedChoice `json:"choices"`
+}
+
+type capturedChoice struct {
+	Index   int              `json:"index"`
+	Delta   *capturedMessage `json:"delta"`
+	Message *capturedMessage `json:"message"`
+}
+
+type capturedMessage struct {
+	Content   *string            `json:"content"`
+	ToolCalls []capturedToolCall `json:"tool_calls"`
+}
+
+// UnmarshalJSON reads a tool call in the wire shape. A streamed delta carries
+// an index; a complete message does not.
+func (t *capturedToolCall) UnmarshalJSON(b []byte) error {
+	var wire struct {
+		Index    *int   `json:"index"`
+		ID       string `json:"id"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
 	}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		return err
+	}
+	t.index = -1
+	if wire.Index != nil {
+		t.index = *wire.Index
+	}
+	t.id, t.name, t.arguments = wire.ID, wire.Function.Name, wire.Function.Arguments
+	return nil
+}
 
-	writer := httpsnoop.Wrap(w, httpsnoop.Hooks{
-		WriteHeader: func(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
-			return func(statusCode int) {
-				capture.writeHeader(next, statusCode)
-			}
-		},
+// writerFunc adapts a function to io.Writer.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// newDecodeCapture wraps w so every byte written through it is also observed
+// by the returned capture. httpsnoop keeps w's http.Flusher, http.Hijacker and
+// io.ReaderFrom behavior, and the ReadFrom hook routes bulk copies through
+// the same observation.
+func newDecodeCapture(w http.ResponseWriter) (http.ResponseWriter, *decodeCapture) {
+	c := &decodeCapture{header: w.Header()}
+	wrapped := httpsnoop.Wrap(w, httpsnoop.Hooks{
 		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
-			return func(body []byte) (int, error) {
-				return capture.write(next, body)
+			return func(p []byte) (int, error) {
+				c.observe(p)
+				return next(p)
 			}
 		},
-		ReadFrom: func(_ httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+		ReadFrom: func(httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
 			return func(src io.Reader) (int64, error) {
-				return capture.readFrom(w.Write, src)
+				return io.Copy(writerFunc(func(p []byte) (int, error) {
+					c.observe(p)
+					return w.Write(p)
+				}), src)
 			}
 		},
 	})
-
-	finalize := func() map[string]any {
-		capture.flushSSEBuffer()
-		if len(capture.bodyBuffer) > 0 {
-			capture.extractFromBody(capture.bodyBuffer)
-		}
-		return capture.capturedParams
-	}
-
-	return writer, finalize
+	return wrapped, c
 }
 
-func (c *kvTransferParamsCapture) writeHeader(next httpsnoop.WriteHeaderFunc, statusCode int) {
-	c.wroteHeader = true
-	next(statusCode)
-}
-
-func (c *kvTransferParamsCapture) write(next httpsnoop.WriteFunc, body []byte) (int, error) {
-	c.interceptBody(body)
-	return next(body)
-}
-
-func (c *kvTransferParamsCapture) readFrom(next httpsnoop.WriteFunc, src io.Reader) (int64, error) {
-	if c.isSSE(nil) {
-		// SSE: stream through while intercepting complete lines
-		n, err := io.Copy(kvTransferParamsCaptureStreamWriter{
-			capture: c,
-			forward: next,
-		}, src)
-		if err != nil {
-			return n, err
-		}
-		return n, nil
+func (c *decodeCapture) observe(p []byte) {
+	if !c.started {
+		c.started = true
+		c.sse = strings.HasPrefix(c.header.Get("Content-Type"), "text/event-stream")
 	}
-
-	// Non-streaming: buffer full body for extraction
-	body, err := io.ReadAll(src)
-	if err != nil {
-		return 0, err
-	}
-	c.bodyBuffer = append(c.bodyBuffer, body...)
-	n, err := next(body)
-	return int64(n), err
-}
-
-func (c *kvTransferParamsCapture) interceptBody(body []byte) {
-	if c.isSSE(body) {
-		c.interceptSSEChunk(body)
-	} else {
-		c.bodyBuffer = append(c.bodyBuffer, body...)
-	}
-}
-
-func (c *kvTransferParamsCapture) isSSE(body []byte) bool {
-	if c.streaming {
-		return true
-	}
-	contentType := c.header.Get("Content-Type")
-	if strings.Contains(contentType, "text/event-stream") || bytes.HasPrefix(body, []byte("data:")) {
-		c.streaming = true
-		return true
-	}
-	return false
-}
-
-func (c *kvTransferParamsCapture) interceptSSEChunk(body []byte) {
-	c.streamBuffer = append(c.streamBuffer, body...)
-	for {
-		lineEnd := bytes.IndexByte(c.streamBuffer, '\n')
-		if lineEnd < 0 {
-			break
-		}
-		line := c.streamBuffer[:lineEnd+1]
-		c.extractFromSSELine(line)
-		c.streamBuffer = c.streamBuffer[lineEnd+1:]
-	}
-}
-
-func (c *kvTransferParamsCapture) flushSSEBuffer() {
-	if len(c.streamBuffer) == 0 {
+	if c.overflow {
 		return
 	}
-	c.extractFromSSELine(c.streamBuffer)
-	c.streamBuffer = nil
+	if !c.sse {
+		if c.body.Len()+len(p) > maxCapturedResponseBytes {
+			c.overflow = true
+			c.body.Reset()
+			return
+		}
+		c.body.Write(p)
+		return
+	}
+	c.pending = append(c.pending, p...)
+	for {
+		i := bytes.IndexByte(c.pending, '\n')
+		if i < 0 {
+			break
+		}
+		c.absorbLine(c.pending[:i])
+		c.pending = c.pending[i+1:]
+	}
+	if len(c.pending) > maxCapturedResponseBytes {
+		c.overflow = true
+		c.pending = nil
+	}
 }
 
-func (c *kvTransferParamsCapture) extractFromSSELine(line []byte) {
-	trimmedLine := bytes.TrimRight(line, "\r\n")
-	data, ok := bytes.CutPrefix(trimmedLine, []byte("data: "))
+// absorbLine reads one SSE line. Only data frames carry content; comments and
+// other fields are ignored.
+func (c *decodeCapture) absorbLine(line []byte) {
+	line = bytes.TrimRight(line, "\r")
+	data, ok := bytes.CutPrefix(line, []byte("data:"))
 	if !ok {
 		return
 	}
-	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == reqcommon.SSEDoneMarker {
 		return
 	}
+	c.absorb(data, true)
+}
 
-	var response map[string]any
-	if err := json.Unmarshal(data, &response); err != nil {
+// absorb folds one response body or stream chunk into the capture.
+func (c *decodeCapture) absorb(data []byte, streaming bool) {
+	var resp capturedResponse
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// Keep numbers as written so block IDs and ports replay verbatim.
+	dec.UseNumber()
+	if err := dec.Decode(&resp); err != nil {
+		c.unusable = true
 		return
 	}
-
-	if params, ok := response[kvTransferParamsField].(map[string]any); ok {
-		c.capturedParams = params
+	if resp.KVTransferParams != nil {
+		c.kvParams = resp.KVTransferParams
+	}
+	for _, choice := range resp.Choices {
+		if choice.Index != 0 {
+			c.unusable = true
+			return
+		}
+		switch {
+		case streaming && choice.Delta != nil:
+			c.absorbDelta(choice.Delta)
+		case !streaming && choice.Message != nil:
+			c.absorbMessage(choice.Message)
+		}
 	}
 }
 
-func (c *kvTransferParamsCapture) extractFromBody(body []byte) {
-	if len(bytes.TrimSpace(body)) == 0 {
-		return
+func (c *decodeCapture) absorbMessage(m *capturedMessage) {
+	if m.Content != nil {
+		c.content.WriteString(*m.Content)
 	}
-
-	var response map[string]any
-	if err := json.Unmarshal(body, &response); err != nil {
-		return
-	}
-
-	if params, ok := response[kvTransferParamsField].(map[string]any); ok {
-		c.capturedParams = params
+	for i := range m.ToolCalls {
+		tc := m.ToolCalls[i]
+		c.calls = append(c.calls, &tc)
 	}
 }
 
-type kvTransferParamsCaptureStreamWriter struct {
-	capture *kvTransferParamsCapture
-	forward httpsnoop.WriteFunc
+// absorbDelta folds one streamed delta in. Tool calls arrive in fragments keyed
+// by index: the id and name in the first, the arguments spread across the rest.
+func (c *decodeCapture) absorbDelta(d *capturedMessage) {
+	if d.Content != nil {
+		c.content.WriteString(*d.Content)
+	}
+	for i := range d.ToolCalls {
+		frag := d.ToolCalls[i]
+		ix := frag.index
+		if ix < 0 {
+			ix = i
+		}
+		if c.callByIx == nil {
+			c.callByIx = make(map[int]*capturedToolCall)
+		}
+		call, ok := c.callByIx[ix]
+		if !ok {
+			call = &capturedToolCall{}
+			c.callByIx[ix] = call
+			c.calls = append(c.calls, call)
+		}
+		if call.id == "" {
+			call.id = frag.id
+		}
+		if call.name == "" {
+			call.name = frag.name
+		}
+		call.arguments += frag.arguments
+	}
 }
 
-func (w kvTransferParamsCaptureStreamWriter) Write(body []byte) (int, error) {
-	w.capture.interceptBody(body)
-	return w.forward(body)
+// result returns the decode engine's replayable kv_transfer_params and the
+// assistant message it generated. ok is false when the response cannot be
+// cached: no usable params, an unparsable or multi-choice response, or a body
+// over the capture limit.
+func (c *decodeCapture) result() (params, reply map[string]any, ok bool) {
+	if c.sse {
+		if len(c.pending) > 0 {
+			c.absorbLine(c.pending)
+			c.pending = nil
+		}
+	} else if c.body.Len() > 0 {
+		body := c.body.Bytes()
+		c.body = bytes.Buffer{}
+		c.absorb(body, false)
+	}
+	if c.unusable || c.overflow {
+		return nil, nil, false
+	}
+	params, ok = completeKVParams(c.kvParams)
+	if !ok {
+		return nil, nil, false
+	}
+	reply = map[string]any{reqcommon.FieldRole: roleAssistant}
+	if content := c.content.String(); content != "" {
+		reply[reqcommon.FieldContent] = content
+	}
+	if len(c.calls) > 0 {
+		calls := make([]any, len(c.calls))
+		for i, call := range c.calls {
+			calls[i] = map[string]any{
+				"id":   call.id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      call.name,
+					"arguments": call.arguments,
+				},
+			}
+		}
+		reply["tool_calls"] = calls
+	}
+	return params, reply, true
 }

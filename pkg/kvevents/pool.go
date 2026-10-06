@@ -31,13 +31,14 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
 
 const (
-	defaultEventSourceDeviceTier = "gpu"
-	defaultPodSelector           = "llm-d.ai/inference-serving=true"
+	defaultEventSourceDeviceTier = kvcache.GPUTier
+	defaultPodSelector           = ""
 )
 
 // normalizeDeviceTier lowercases an event's device tier and defaults an empty
@@ -116,6 +117,7 @@ type Config struct {
 // PodDiscoveryConfig holds configuration for the Kubernetes pod reconciler.
 type PodDiscoveryConfig struct {
 	// PodLabelSelector is a label selector string for filtering which pods to watch.
+	// Empty matches every pod.
 	// Example: "app=vllm" or "app=vllm,tier=gpu"
 	PodLabelSelector string `json:"podLabelSelector"`
 	// PodNamespace limits the reconciler to watch pods in a specific namespace.
@@ -194,9 +196,12 @@ type Pool struct {
 // Registration is idempotent (guarded by a sync.Once).
 func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
 	adapter EngineAdapter,
-) *Pool {
+) (*Pool, error) {
 	if cfg == nil {
 		cfg = DefaultConfig()
+	}
+	if cfg.Concurrency <= 0 {
+		return nil, fmt.Errorf("kvEventsConfig.concurrency must be positive, got %d", cfg.Concurrency)
 	}
 
 	p := &Pool{
@@ -216,7 +221,7 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 
 	metrics.Register()
 
-	return p
+	return p, nil
 }
 
 // Span start options are built once. Passing them variadically at each call
@@ -312,15 +317,9 @@ func (p *Pool) AddTask(task *RawMessage) {
 		return
 	}
 
-	//nolint:gosec // if concurrency overflows then the world is in trouble anyway
 	queueIndex := h.Sum32() % uint32(p.concurrency)
 	p.queues[queueIndex].Add(task)
 	p.addQueueDepth(1)
-}
-
-// resetForSource queues a pod reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string) {
-	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -360,7 +359,7 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		p.clearPod(ctx, podID)
+		p.clearPod(ctx, podID, msg.retire)
 		return
 	}
 
@@ -431,13 +430,16 @@ func (p *Pool) decode(ctx context.Context, msg *RawMessage) (string, string, Eve
 	return podID, modelName, batch, nil
 }
 
-func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
+func (p *Pool) clearPod(ctx context.Context, podIdentifier string, retire bool) {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	if err := p.index.Clear(ctx, podIdentifier); err != nil {
 		debugLogger.Error(err, "Failed to clear pod from index",
 			"podIdentifier", podIdentifier)
 	}
 	p.dedup.clear(podIdentifier)
+	if retire {
+		p.groupCatalog.Clear(podIdentifier)
+	}
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -619,8 +621,12 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 			var extraFeatures []*kvblock.BlockExtraFeatures
 			if ev.ExtraKeys != nil {
+				var loraName string
+				if ev.LoraName != nil {
+					loraName = *ev.LoraName
+				}
 				var err error
-				extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys)
+				extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys, loraName)
 				if err != nil {
 					debugLogger.Error(err, "Failed to parse extra keys",
 						"podIdentifier", podIdentifier)
@@ -773,7 +779,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			p.clearPod(ctx, podIdentifier)
+			p.clearPod(ctx, podIdentifier, false)
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)

@@ -245,9 +245,6 @@ role: decode
 
 To accommodate this **without code changes**, you can configure the **EndpointPickerConfig** to use the generic `label-selector-filter` plugin instead of the hardcoded `encode-filter` / `prefill-filter` / `decode-filter`.
 
-> [!NOTE]
-> The previous filter type `by-label` is deprecated. Use `label-selector-filter` with standard Kubernetes label selector syntax instead.
-
 ### Configuration Examples
 
 #### P/D Configuration
@@ -255,7 +252,7 @@ To accommodate this **without code changes**, you can configure the **EndpointPi
 Below is a minimal `EndpointPickerConfig` for P/D disaggregation using custom labels:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
   # Prefill selection: match Pods with label role=prefill
@@ -311,7 +308,7 @@ schedulingProfiles:
 Below is an `EndpointPickerConfig` for full E/P/D disaggregation using custom labels:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
   # Encoding selection: match Pods with label role=encode
@@ -434,7 +431,7 @@ Deployments that do not declare any conditional-decode gate plugin still reject 
 A minimal coordinator-topology configuration:
 
 ```yaml
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
 plugins:
   - type: token-producer
@@ -599,7 +596,7 @@ When the request also carries the `x-kv-cache-source-host-port` header (set by
 the EPP `p2p-source-producer` to a peer holding more cached prefix than the pod
 computing the prefix), the sidecar injects an additional `remote_kv_source` key
 so vLLM pulls that cached prefix over the P2P tier instead of recomputing it.
-Under disaggregation the prefiller leg carries `{"remote_decoder": {...},
+Under disaggregation the prefill request carries `{"remote_decoder": {...},
 "remote_kv_source": {"kv_request_id": <own id>, "remote_host": <source host>,
 "remote_port": <p2p-connector-port>}}` (the only supported multi-key
 combination); without a prefiller the decoder-only request carries
@@ -679,16 +676,110 @@ With `DP_SIZE_LOCAL: 8` every pod binds P2P `7777-7784`, KV events
 compensated; `data_parallel_index` and the global rank carried in KV-event
 batches are unchanged.
 
+### Bidirectional KV Transfer (`nixlv2`)
+
+With `--enable-bidirectional-kv-xfer`, the prefill engine reads the KV blocks
+the decode engine still holds from the previous turn of a conversation instead
+of recomputing the history. The decode response carries the blocks' location in
+`kv_transfer_params`. The sidecar keeps it until the conversation's next request
+and replays it on that request's prefill leg.
+
+Requirements:
+
+- The engines run NIXL with `"bidirectional_kv_xfer": true` in
+  `kv_connector_extra_config`. The decode engine releases its blocks after
+  `decoder_kv_blocks_ttl` (default 480 seconds), so `--bidirectional-cache-ttl`
+  must not exceed it.
+- The EPP runs the session-affinity plugin with the encoded-endpoint strategy,
+  so a follow-up returns to the same decode pod and carries the pod's session
+  token (`x-session-token` by default; `--bidirectional-session-header` renames
+  it). The sidecar accepts a token only when it names an endpoint of its own
+  pod, so `POD_NAME` and `POD_NAMESPACE` must be set from the downward API. Any
+  client can construct a token; it selects the feature for a request and does
+  not authenticate the caller.
+- Requests are Chat Completions with a single choice. Other APIs, `n` greater
+  than 1, MoRI-IO write mode, and chunked decode (`--decode-chunk-size`) are
+  not supported; those requests run the ordinary P/D flow.
+
+The prefill engine copies the replayed blocks over the leading blocks of the new
+prompt without comparing token contents. The sidecar therefore addresses each
+cached entry by a digest of the request fields that determine the prompt tokens
+(`model`, `cache_salt`, `tools`, `chat_template`, `chat_template_kwargs`, and
+similar) and of the full message history, including the reply the decoder
+generated. A follow-up gets an entry only when its messages extend the turn that
+produced it field for field. A different conversation or tenant, an edited
+message or reply, or a changed tool set misses, and prefill recomputes as usual.
+An entry is used once, because the prefill engine's read releases the
+decode-side blocks, and expires after `--bidirectional-cache-ttl`.
+
+When `--enable-p2p-pull` is also set, the prefill request carries both the NIXL
+read of the decode-side blocks and the `remote_kv_source` pull. The engine's
+`MultiConnector` takes the first connector that reports a hit and applies
+`kv_recompute_threshold` to the NIXL read, so the sidecar has no threshold of
+its own.
+
+The history is matched on message text, so reuse is correct only for models
+whose chat template renders earlier turns the way the decoder generated them.
+A template that drops reasoning from earlier assistant turns, or a reply that
+re-tokenizes differently from the generated tokens, goes undetected by the
+sidecar.
+
 ### General Sidecar Flags
+
+The sidecar's serving TLS flags are shared with the EPP and the coordinator and are
+documented in [TLS](tls.md). `--enable-tls` and `--tls-insecure-skip-verify` configure
+the sidecar's outbound connections to the encode, prefill and decode stages.
 
 | Flag | Env var | Values | Default | Description |
 |---|---|---|---|---|
 | `--enable-tls` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Enable TLS for the specified stages. Example: `--enable-tls=prefiller,decoder` |
 | `--tls-insecure-skip-verify` | — | `prefiller`, `decoder`, `encoder` (comma-separated or repeated) | none | Skip TLS certificate verification for the specified stages. Example: `--tls-insecure-skip-verify=prefiller` |
-| `--tls-min-version` | — | `VersionTLS10`, `VersionTLS11`, `VersionTLS12`, `VersionTLS13` | `VersionTLS12` | Set the minimum TLS version accepted by the sidecar's secure proxy. |
-| `--tls-cipher-suites` | — | Go `crypto/tls` cipher suite names (comma-separated or repeated) | existing secure suite set | Set the TLS cipher suites accepted by the sidecar's secure proxy. Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable. |
 | `--enable-prefiller-sampling` | `ENABLE_PREFILLER_SAMPLING` | `true` / `false` | `false` | If true, the prefill instance is selected randomly from the provided prefill host values. |
-| `--enable-ssrf-protection` | — | `true` / `false` | `false` | Enable SSRF protection using InferencePool allowlisting. |
+| `--enable-ssrf-protection` | — | `true` / `false` | `false` | Enable SSRF protection using InferencePool allowlisting. See [SSRF Protection](#ssrf-protection). |
+
+### SSRF Protection
+
+The sidecar connects to the addresses in the `x-prefiller-host-port` and
+`x-encoder-hosts-ports` request headers, and tells vLLM to pull cached KV blocks
+from the address in `x-kv-cache-source-host-port`. With
+`--enable-ssrf-protection=false` the sidecar does not check these addresses and
+logs a warning at startup. A client that can set the headers chooses the target.
+That includes any client that reaches the sidecar port without going through
+the EPP.
+
+Set `--enable-ssrf-protection=true` in deployments reachable by untrusted
+clients. The sidecar then accepts a target only when its host is the IP or name
+of a pod selected by the InferencePool. The port is not checked. A request with
+a disallowed prefill target is rejected with `403`, and disallowed encoder
+targets are dropped from the request.
+
+Enabling the flag requires:
+
+- `--inference-pool=<namespace>/<name>`, or the `INFERENCE_POOL` environment
+  variable. A value without a namespace refers to the `default` namespace. The
+  sidecar does not start when the pool is not set.
+- `--pool-group`, when the InferencePool is not in the default
+  `inference.networking.k8s.io` API group.
+- `list` and `watch` permissions on `inferencepools` and on `pods` in the
+  InferencePool's namespace, granted to the service account of the decode pods:
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: pd-sidecar-ssrf-protection
+  rules:
+  - apiGroups: ["inference.networking.k8s.io"]
+    resources: ["inferencepools"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  ```
+
+  Without the `inferencepools` permissions the sidecar does not start serving.
+  Without the `pods` permissions the allowlist stays empty and every request
+  with a prefill target is rejected.
 
 ### Connector-Specific Flags
 
@@ -696,8 +787,12 @@ batches are unchanged.
 |---|---|---|---|---|
 | `mooncake` | `--mooncake-bootstrap-port` | `MOONCAKE_BOOTSTRAP_PORT` | `8998` | Port used to query the Mooncake bootstrap endpoint on prefill pods. Corresponds to vLLM's `VLLM_MOONCAKE_BOOTSTRAP_PORT`. |
 | `sglang` | — | `SGLANG_BOOTSTRAP_PORT` | `8998` | Port used for the SGLang bootstrap endpoint on prefill pods. |
-| `offloading` | `--p2p-connector-port` | `P2P_CONNECTOR_PORT` | `7777` | Prefiller's OffloadingConnector P2P tier listening port (rank-0 port under data parallelism), injected as `remote_port` on the decode leg so the decoder can pull KV. |
+| `offloading` | `--p2p-connector-port` | `P2P_CONNECTOR_PORT` | `7777` | Prefiller's OffloadingConnector P2P tier listening port (rank-0 port under data parallelism), injected as `remote_port` on the decode request so the decoder can pull KV. |
 | `nixlv2` | `--enable-p2p-pull` | — | `false` | Declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXLv2, i.e. the engines run `MultiConnector(NixlConnector + OffloadingConnector)`. NIXL moves KV prefill to decode while the OffloadingConnector pulls the cached prefix named by `x-kv-cache-source-host-port`. Rejected at startup with any other connector; `offloading` provides the tier natively and needs no flag. |
+| `nixlv2` | `--enable-bidirectional-kv-xfer` | — | `false` | Let the prefill engine read a conversation's KV blocks from the decode engine that served its previous turn. See [Bidirectional KV Transfer](#bidirectional-kv-transfer-nixlv2). Requires `POD_NAME` and `POD_NAMESPACE`. |
+| `nixlv2` | `--bidirectional-session-header` | — | `x-session-token` | Request header carrying the EPP session token. Must match the session-affinity plugin's header. |
+| `nixlv2` | `--bidirectional-cache-size` | — | `4096` | Maximum number of conversation turns whose decode-side KV blocks are kept for a follow-up request. |
+| `nixlv2` | `--bidirectional-cache-ttl` | — | `480s` | How long a turn's decode-side KV blocks stay usable. Must not exceed the engine's `decoder_kv_blocks_ttl`. |
 
 ---
 

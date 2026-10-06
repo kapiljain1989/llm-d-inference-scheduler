@@ -22,61 +22,68 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/metrics"
 )
 
-// tokenLimitMap returns the map holding the token-limit fields: sampling_params
-// for the generate API (created if absent), or the request itself otherwise.
-// The second return value reports whether an empty sampling_params map was
-// synthesized; callers must drop it before dispatching downstream if it stays empty.
-func tokenLimitMap(req map[string]any, apiType APIType) (map[string]any, bool) {
-	if apiType != APITypeGenerate {
-		return req, false
+// MoRI-IO WRITE-mode kv_transfer_params fields, populated by the sidecar
+// so the prefill engine can push KV to decode via RDMA Write.
+const (
+	requestFieldRemoteNotifyPort = "remote_notify_port"
+	requestFieldRemoteDPRank     = "remote_dp_rank"
+	// requestFieldRemoteDPRankOverride tells the decode-side connector to use
+	// the sidecar's remote_dp_rank verbatim rather than recomputing its own hash.
+	requestFieldRemoteDPRankOverride = "remote_dp_rank_override"
+	requestFieldRemoteHandshakePort  = "remote_handshake_port"
+)
+
+func newNIXLV2RequestID() (string, error) {
+	id, err := uuid.NewUUID()
+	if err != nil {
+		return "", err
 	}
-	if sp, ok := req[requestFieldSamplingParams].(map[string]any); ok {
-		return sp, false
-	}
-	sp := map[string]any{}
-	req[requestFieldSamplingParams] = sp
-	return sp, true
+	return id.String(), nil
 }
 
-func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort, kvCacheSource string, apiType APIType) {
-	tokenLimitFields := tokenLimitFieldsForAPIType(apiType)
-	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2", "url", prefillPodHostPort, "tokenLimitFields", tokenLimitFields)
+func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort, kvCacheSource string, apiType reqcommon.APIType) {
+	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2", "url", prefillPodHostPort, "api", apiType.String())
 
-	original, completionRequest, ok := s.readJSONBody(r, w)
+	original, body, ok := s.readJSONBody(r, w)
 	if !ok {
 		return
 	}
 
 	// Generate unique request UUID
-	uuid, err := uuid.NewUUID()
+	uuidStr, err := s.nixlRequestIDFn()
 	if err != nil {
 		if err := errorBadGateway(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
 		}
 		return
 	}
-	uuidStr := uuid.String()
 
 	// Parallel-dispatch path synthesises decode's kv_transfer_params from config
 	// instead of the prefill response. The serial path below is unchanged when off.
 	if s.config.MoRIIOParallelDispatch && s.config.MoRIIOWriteMode {
 		// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing.
 		transferID := "tx" + uuidStr
-		s.runNIXLProtocolV2WriteParallel(w, r, original, completionRequest, uuidStr, transferID, prefillPodHostPort, kvCacheSource)
+		s.runNIXLProtocolV2WriteParallel(w, r, original, body, uuidStr, transferID, prefillPodHostPort, kvCacheSource, apiType)
 		return
 	}
 
@@ -88,68 +95,55 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	prefillSpan.SetAttributes(
-		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
-		attribute.String("llm_d.pd_proxy.prefill_target", prefillPodHostPort),
-		attribute.String("llm_d.pd_proxy.connector", KVConnectorNIXLV2),
+		semconv.LLMDPDProxyRequestID(uuidStr),
+		semconv.LLMDPDProxyPrefillTarget(prefillPodHostPort),
+		semconv.LLMDPDProxyConnector(constants.KVConnectorNIXLV2),
 	)
 	prefillStart := time.Now()
 
 	// 1. Prepare prefill request
 	preq := r.Clone(ctx)
 
-	preq.Header.Add(requestHeaderRequestID, uuidStr)
+	preq.Header.Add(reqcommon.RequestIDHeaderKey, uuidStr)
 
-	// Pin both legs to the same DP rank; the header is skipped for single-DP.
-	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
+	// KV metadata uses global ranks; HTTP dispatch uses pod-local ranks.
+	globalDPRank, localDPRank := pickDPRanks(
+		uuidStr,
+		s.config.MoRIIODPSize,
+		s.config.MoRIIODPSizeLocal,
+	)
 	if s.config.MoRIIODPSize > 1 {
-		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
+		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(localDPRank))
 	}
 
-	// Save original values based on API type
-	streamValue, streamOk := completionRequest[requestFieldStream]
-	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
-
-	// Save and override token limit fields for prefill
-	type savedField struct {
-		field   string
-		val     any
-		present bool
-	}
-	tokenMap, createdSamplingParams := tokenLimitMap(completionRequest, apiType)
-	savedTokenValues := make([]savedField, len(tokenLimitFields))
-	for i, field := range tokenLimitFields {
-		if v, ok := tokenMap[field]; ok {
-			savedTokenValues[i] = savedField{field: field, val: v, present: true}
-		} else {
-			savedTokenValues[i] = savedField{field: field}
-		}
-	}
+	// Keeps the client's body intact for the decode request below.
+	prefillRequest := maps.Clone(body)
 
 	// WRITE mode populates the destination fields the prefill engine needs for
 	// its RDMA Write; READ mode leaves them nil per the standard NIXLv2 contract.
 	if s.config.MoRIIOWriteMode {
 		// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing.
 		transferID := "tx" + uuidStr
-		completionRequest[requestFieldKVTransferParams] = map[string]any{
-			requestFieldDoRemoteDecode:       true,
-			requestFieldDoRemotePrefill:      false,
-			requestFieldRemoteEngineID:       nil,
-			requestFieldRemoteBlockIDs:       nil,
-			requestFieldRemoteHost:           s.currentDecodePodIP(ctx),
-			requestFieldRemotePort:           nil,
+		prefillRequest[reqcommon.FieldKVTransferParams] = map[string]any{
+			reqcommon.FieldDoRemoteDecode:    true,
+			reqcommon.FieldDoRemotePrefill:   false,
+			reqcommon.FieldRemoteEngineID:    nil,
+			reqcommon.FieldRemoteBlockIDs:    nil,
+			reqcommon.FieldRemoteHost:        s.currentDecodePodIP(ctx),
+			reqcommon.FieldRemotePort:        nil,
 			requestFieldRemoteNotifyPort:     s.config.MoRIIODecodeNotifyPort,
-			requestFieldRemoteDPRank:         dpRank,
+			requestFieldRemoteDPRank:         globalDPRank,
 			requestFieldRemoteDPRankOverride: true,
 			requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
 			requestFieldTransferID:           transferID,
 			"tp_size":                        s.config.MoRIIOTPSize,
 			"remote_dp_size":                 s.config.MoRIIODPSize,
 		}
-		// Wide-EP fan-out (prefill leg, serial path): remote_hosts must be the
+		// Wide-EP fan-out (prefill request, serial path): remote_hosts must be the
 		// DECODE-side pod IPs so prefill handshakes the right pods. Re-resolved
 		// per request so peer restarts (new IP) are picked up within the TTL.
 		if decodeHosts := s.currentDecodeHosts(ctx); len(decodeHosts) > 0 {
-			pkv := completionRequest[requestFieldKVTransferParams].(map[string]any)
+			pkv := prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any)
 			hosts := make([]any, len(decodeHosts))
 			for i, h := range decodeHosts {
 				hosts[i] = h
@@ -160,78 +154,35 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 			}
 		}
 	} else {
-		completionRequest[requestFieldKVTransferParams] = map[string]any{
-			requestFieldDoRemoteDecode:  true,
-			requestFieldDoRemotePrefill: false,
-			requestFieldRemoteEngineID:  nil,
-			requestFieldRemoteBlockIDs:  nil,
-			requestFieldRemoteHost:      nil,
-			requestFieldRemotePort:      nil,
+		prefillRequest[reqcommon.FieldKVTransferParams] = map[string]any{
+			reqcommon.FieldDoRemoteDecode:  true,
+			reqcommon.FieldDoRemotePrefill: false,
+			reqcommon.FieldRemoteEngineID:  nil,
+			reqcommon.FieldRemoteBlockIDs:  nil,
+			reqcommon.FieldRemoteHost:      nil,
+			reqcommon.FieldRemotePort:      nil,
 		}
 	}
 
-	// Bidirectional KV transfer: inject cached decode params into prefill request.
-	// D-side GPU blocks take precedence over P2P CPU offload (composition skipped when cache hit).
-	usedBidirectionalCache := false
-	cacheKey := s.bidirectionalCacheKey(r, completionRequest)
-	if cacheKey != "" && s.conversationCache != nil {
-		if cached, ok := s.conversationCache.Get(cacheKey); ok {
-			// Check if cached remote tokens exceed recompute threshold
-			remoteTokens := 0
-			if tokens, ok := cached[requestFieldRemoteNumTokens].(float64); ok {
-				remoteTokens = int(tokens)
-			}
-			if remoteTokens >= s.config.BidirectionalRecomputeThreshold {
-				// Inject cached params using allowlist (only P-side consumed fields)
-				kvParams := completionRequest[requestFieldKVTransferParams].(map[string]any)
-				allowedKeys := []string{
-					requestFieldRemoteEngineID,
-					requestFieldRemoteRequestID,
-					requestFieldRemoteHost,
-					requestFieldRemotePort,
-					requestFieldRemoteBlockIDs,
-					requestFieldRemoteNumTokens,
-					requestFieldTPSize,
-					"dp_size",
-					requestFieldRemoteBlocksExpiry,
-					requestFieldRemoteKVSource,
-				}
-				for _, k := range allowedKeys {
-					if v, ok := cached[k]; ok {
-						kvParams[k] = v
-					}
-				}
-				usedBidirectionalCache = true
-				s.logger.V(logging.DEBUG).Info("injected cached kv_transfer_params",
-					"cache_key", cacheKey,
-					"remote_tokens", remoteTokens,
-					"threshold", s.config.BidirectionalRecomputeThreshold)
-			} else {
-				s.logger.V(logging.DEBUG).Info("skipped D→P pull: below recompute threshold",
-					"cache_key", cacheKey,
-					"remote_tokens", remoteTokens,
-					"threshold", s.config.BidirectionalRecomputeThreshold)
-			}
+	// Bidirectional KV transfer: replay the decode-side blocks of this
+	// conversation's previous turn so the prefill engine can read them instead of
+	// recomputing the history. The P2P source below stays on the request: the
+	// engine's MultiConnector takes the first connector that reports a hit and
+	// applies kv_recompute_threshold to the NIXL read itself.
+	reuse := s.newKVReuse(r, body, apiType)
+	if reuse != nil {
+		if cached := reuse.take(); cached != nil {
+			injectBidirectionalKVParams(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), cached)
+			s.logger.V(logging.DEBUG).Info("replaying decode-side kv_transfer_params", "request_id", uuidStr)
 		}
 	}
 
-	// Skip P2P pull when bidirectional cached params are used. D-side GPU blocks take
-	// precedence over CPU-tier P2P reuse. The bidirectional cache has already injected
-	// remote_kv_source if available, allowing the engine to make informed decisions about
-	// which source to use or whether to fall back if the GPU transfer fails.
-	if !usedBidirectionalCache {
-		// Compose the OffloadingConnector p2p pull onto the NIXL prefill leg.
-		s.addP2PPullToPrefill(completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
-	}
+	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
+	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
-	completionRequest[requestFieldStream] = false
-	delete(completionRequest, requestFieldStreamOptions)
+	reqcommon.CapSingleToken(prefillRequest, apiType)
 
-	for _, field := range tokenLimitFields {
-		tokenMap[field] = 1
-	}
-
-	pbody, err := json.Marshal(completionRequest)
+	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
@@ -251,6 +202,8 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	// 2. Forward request to prefiller
 	s.logger.V(logging.DEBUG).Info("sending prefill request", "to", prefillPodHostPort)
+	// Guarded: stringifying the body allocates a copy per request even when
+	// TRACE is disabled.
 	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
 		trace.Info("Prefill request", logging.HTTPBodyKey, string(pbody))
 	}
@@ -291,15 +244,17 @@ retryLoop:
 	}
 
 	prefillDuration := time.Since(prefillStart)
+	metrics.RecordPrefillDuration(prefillDuration)
 	prefillSpan.SetAttributes(
-		attribute.Int("llm_d.pd_proxy.prefill.status_code", pw.statusCode),
-		attribute.Float64("llm_d.pd_proxy.prefill.duration_ms", float64(prefillDuration.Milliseconds())),
+		semconv.LLMDPDProxyPrefillStatusCode(pw.statusCode),
+		semconv.LLMDPDProxyPrefillDurationMs(float64(prefillDuration.Milliseconds())),
 	)
 
 	if isHTTPError(pw.statusCode) {
+		metrics.RecordError(metrics.StagePrefill)
 		s.logger.Error(fmt.Errorf("prefill returned %d", pw.statusCode), "prefill request failed",
 			"request_id", uuidStr,
-			"body", pw.buffer.String())
+			logging.HTTPBodyKey, pw.buffer.String())
 		prefillSpan.SetStatus(codes.Error, "prefill request failed")
 		prefillSpan.End()
 
@@ -327,7 +282,7 @@ retryLoop:
 
 	// 3. Verify response
 
-	pKVTransferParams, ok := prefillerResponse[requestFieldKVTransferParams]
+	pKVTransferParams, ok := prefillerResponse[reqcommon.FieldKVTransferParams]
 	if !ok {
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
 	}
@@ -338,9 +293,10 @@ retryLoop:
 		pCachedTokens = 0
 	}
 
-	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
-		trace.Info("received prefiller response", requestFieldKVTransferParams, pKVTransferParams)
-	}
+	s.logger.V(logging.TRACE).Info("received prefiller response",
+		reqcommon.FieldKVTransferParams, pKVTransferParams,
+		"cachedTokens", pCachedTokens,
+		"hasCachedTokens", hasPCachedTokens)
 
 	// Decode Stage
 
@@ -350,71 +306,58 @@ retryLoop:
 	defer decodeSpan.End()
 
 	decodeSpan.SetAttributes(
-		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
-		attribute.String("llm_d.pd_proxy.connector", KVConnectorNIXLV2),
+		semconv.LLMDPDProxyRequestID(uuidStr),
+		semconv.LLMDPDProxyConnector(constants.KVConnectorNIXLV2),
 	)
 	decodeStart := time.Now()
 
 	// 1. Prepare decode request
 	dreq := r.Clone(ctx)
 
-	dreq.Header.Add(requestHeaderRequestID, uuidStr)
+	dreq.Header.Add(reqcommon.RequestIDHeaderKey, uuidStr)
 
-	// Decode's DP rank is PROPAGATED from the prefill leg's returned
-	// kv_transfer_params (remote_dp_rank = the rank prefill actually ran on),
-	// not independently re-derived here. This is the router-applies-the-
-	// connector-returned-rank model (PR #45043 review, njhill): the prefill
-	// connector returns the rank, the router pins the decode leg to it, so both
-	// legs agree without each hashing the request id. The returned rank is
-	// validated to be in [0, dp_size); an omitted, non-numeric, or out-of-range
-	// value falls back to the deterministic hash. The header AND the decode
-	// body's remote_dp_rank are then pinned to the SAME validated value so they
-	// cannot target different ranks and hang the transfer.
-	// DP-rank propagation is a MoRI-IO WRITE-mode concern only. In standard
-	// NIXLv2 READ mode the decode body's remote_dp_rank / remote_dp_rank_override
-	// and the x-data-parallel-rank header are left untouched, matching the legacy
-	// wire shape.
+	// Preserve prefill's global rank for notify routing and dispatch decode to
+	// its pod-local equivalent. Fallback ranks use the selected prefill pod.
 	if s.config.MoRIIOWriteMode {
 		decodeDPRank, usedReturned := resolveDecodeDPRank(pKVTransferParams, uuidStr, s.config.MoRIIODPSize)
 		if pkv, ok := pKVTransferParams.(map[string]any); ok {
+			if !usedReturned && s.config.MoRIIODPSizeLocal > 0 && s.config.MoRIIODPSize > s.config.MoRIIODPSizeLocal {
+				prefillHost := s.resolver().resolveOne(ctx, extractHost(prefillPodHostPort))
+				podIndex := slices.Index(s.currentRemoteHosts(ctx), prefillHost)
+				if podIndex < 0 {
+					err := fmt.Errorf("cannot determine prefill pod index for %q", prefillHost)
+					s.logger.Error(err, "failed to route MoRI-IO decode notify", "request_id", uuidStr)
+					if err := errorBadGateway(err, w); err != nil {
+						s.logger.Error(err, "failed to send error response to client")
+					}
+					return
+				}
+				decodeDPRank = podIndex*s.config.MoRIIODPSizeLocal + localDPRank
+			}
 			if rv, present := pkv[requestFieldRemoteDPRank]; present && !usedReturned && s.config.MoRIIODPSize > 1 {
-				s.logger.V(1).Info("prefill returned invalid/out-of-range remote_dp_rank; using hash fallback",
+				s.logger.Info("prefill returned invalid/out-of-range remote_dp_rank; using fallback DP rank",
 					"request_id", uuidStr, "returned", rv,
 					"dp_size", s.config.MoRIIODPSize, "rank", decodeDPRank)
 			}
 			pkv[requestFieldRemoteDPRank] = decodeDPRank
 			pkv[requestFieldRemoteDPRankOverride] = true
+			if s.config.MoRIIODPSize > 1 {
+				// Decode can execute at a different global rank from prefill.
+				pkv["is_request_leader"] = true
+			}
 		}
 		if s.config.MoRIIODPSize > 1 {
-			dreq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(decodeDPRank))
+			decodeLocalDPRank := foldDPRankToLocal(
+				decodeDPRank,
+				s.config.MoRIIODPSize,
+				s.config.MoRIIODPSizeLocal,
+			)
+			dreq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(decodeLocalDPRank))
 		}
 	}
 
-	delete(completionRequest, requestFieldStream)
-	streamingEnabled := false
-	if streamOk {
-		completionRequest[requestFieldStream] = streamValue
-		if streamBool, ok := streamValue.(bool); ok {
-			streamingEnabled = streamBool
-		}
-	}
-	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.streaming", streamingEnabled))
-	if streamOptionsOk {
-		completionRequest[requestFieldStreamOptions] = streamOptionsValue
-	}
-
-	for i := range savedTokenValues {
-		sv := &savedTokenValues[i]
-		delete(tokenMap, sv.field)
-		if sv.present {
-			tokenMap[sv.field] = sv.val
-		}
-	}
-	// Drop the sampling_params map synthesized for prefill capping if it ended up
-	// empty, so the decode request matches the caller's original (which omitted it).
-	if createdSamplingParams && len(tokenMap) == 0 {
-		delete(completionRequest, requestFieldSamplingParams)
-	}
+	streamingEnabled, _ := body[reqcommon.FieldStream].(bool)
+	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeStreaming(streamingEnabled))
 
 	// WRITE mode: backfill the decode-side kv_transfer_params fields that
 	// vLLM's request_finished response does not echo back, sourcing the
@@ -439,7 +382,7 @@ retryLoop:
 			if _, present := dKVParams["remote_dp_size"]; !present {
 				dKVParams["remote_dp_size"] = s.config.MoRIIODPSize
 			}
-			// Wide-EP fan-out (decode leg, serial path): remote_hosts must be the
+			// Wide-EP fan-out (decode request, serial path): remote_hosts must be the
 			// PREFILL-side pod IPs so decode fans out handshakes across prefill pods.
 			// Re-resolved per request so peer restarts (new IP) are picked up.
 			if remoteHosts := s.currentRemoteHosts(ctx); len(remoteHosts) > 0 {
@@ -458,9 +401,9 @@ retryLoop:
 			}
 		}
 	}
-	completionRequest[requestFieldKVTransferParams] = pKVTransferParams
+	body[reqcommon.FieldKVTransferParams] = pKVTransferParams
 
-	dbody, err := json.Marshal(completionRequest)
+	dbody, err := json.Marshal(body)
 	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
@@ -473,48 +416,43 @@ retryLoop:
 	// 2. Forward to local decoder.
 
 	if trace := s.logger.V(logging.TRACE); trace.Enabled() {
-		trace.Info("Decode request", logging.HTTPBodyKey, string(dbody))
+		trace.Info("sending request to decoder", logging.HTTPBodyKey, string(dbody))
 	}
-
-	// Wrap response writer for bidirectional KV transfer when enabled and session token is valid.
-	// The KV capture writer intercepts kv_transfer_params from the decode response without
-	// modifying the response body, then updates the conversation cache on finalize.
-	var kvCaptureFinalize func() map[string]any
-	baseWriter := w
-	if s.bidirectionalSessionID(r) != "" && s.conversationCache != nil {
-		baseWriter, kvCaptureFinalize = newKVTransferParamsCaptureWriter(w)
+	statusWriter, decodeStatus := captureResponseStatus(w)
+	responseWriter := statusWriter
+	var capture *decodeCapture
+	if reuse != nil {
+		responseWriter, capture = newDecodeCapture(statusWriter)
 	}
-
-	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterWithFinalize(baseWriter, pCachedTokens, streamingEnabled)
+	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterWithFinalize(responseWriter, pCachedTokens, streamingEnabled)
+	decodeReturned := false
+	defer recordDecodeAbort(&decodeReturned, decodeStart)
 	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(decodeWriter, dreq)
-	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
+	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDataParallel(dataParallelUsed))
 
 	if !dataParallelUsed {
 		s.logger.V(logging.DEBUG).Info("sending request to decoder", "to", s.config.DecoderURL.Host)
-		decodeSpan.SetAttributes(attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host))
-		s.dispatchDecode(decodeWriter, dreq, completionRequest)
+		decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeTarget(s.config.DecoderURL.Host))
+		s.dispatchDecode(decodeWriter, dreq, body)
 	}
+	decodeReturned = true
 	if err := finalizeDecodeWriter(); err != nil {
+		metrics.RecordDecodeDuration(time.Since(decodeStart))
+		metrics.RecordError(metrics.StageDecode)
 		s.logger.Error(err, "failed to flush cached token response writer")
 		decodeSpan.SetStatus(codes.Error, "failed to flush cached token response writer")
 		return
 	}
 
-	// Update bidirectional KV cache with captured params from decode response
-	if kvCaptureFinalize != nil {
-		if capturedParams := kvCaptureFinalize(); capturedParams != nil {
-			cacheKey := s.bidirectionalCacheKey(r, completionRequest)
-			if cacheKey != "" {
-				s.conversationCache.Add(cacheKey, capturedParams)
-				s.logger.V(logging.DEBUG).Info("cached kv_transfer_params from decode response",
-					"cache_key", cacheKey,
-					"params", capturedParams)
-			}
-		}
-	}
-
 	decodeDuration := time.Since(decodeStart)
-	decodeSpan.SetAttributes(attribute.Float64("llm_d.pd_proxy.decode.duration_ms", float64(decodeDuration.Milliseconds())))
+	metrics.RecordDecodeDuration(decodeDuration)
+	if decodeStatus.failed() {
+		metrics.RecordError(metrics.StageDecode)
+		decodeSpan.SetStatus(codes.Error, "decode request failed")
+	} else if capture != nil && reuse.store(capture) {
+		s.logger.V(logging.DEBUG).Info("stored decode-side kv_transfer_params for the next turn", "request_id", uuidStr)
+	}
+	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDurationMs(float64(decodeDuration.Milliseconds())))
 
 	// Calculate end-to-end P/D timing metrics.
 	// True TTFT captures time from gateway request start to decode start, including
@@ -533,11 +471,11 @@ retryLoop:
 		coordinatorOverhead := decodeStart.Sub(prefillStart.Add(prefillDuration))
 
 		currentSpan.SetAttributes(
-			attribute.Float64("llm_d.pd_proxy.total_duration_ms", float64(totalDuration.Milliseconds())),
-			attribute.Float64("llm_d.pd_proxy.true_ttft_ms", float64(trueTTFT.Milliseconds())),
-			attribute.Float64("llm_d.pd_proxy.prefill_duration_ms", float64(prefillDuration.Milliseconds())),
-			attribute.Float64("llm_d.pd_proxy.decode_duration_ms", float64(decodeDuration.Milliseconds())),
-			attribute.Float64("llm_d.pd_proxy.coordinator_overhead_ms", float64(coordinatorOverhead.Milliseconds())),
+			semconv.LLMDPDProxyTotalDurationMs(float64(totalDuration.Milliseconds())),
+			semconv.LLMDPDProxyTrueTTFTMs(float64(trueTTFT.Milliseconds())),
+			semconv.LLMDPDProxyPrefillDurationMsSummary(float64(prefillDuration.Milliseconds())),
+			semconv.LLMDPDProxyDecodeDurationMsSummary(float64(decodeDuration.Milliseconds())),
+			semconv.LLMDPDProxyCoordinatorOverheadMs(float64(coordinatorOverhead.Milliseconds())),
 		)
 	}
 }
@@ -548,7 +486,8 @@ retryLoop:
 // two upstream calls in parallel so decode's block allocation overlaps prefill.
 func (s *Server) runNIXLProtocolV2WriteParallel(
 	w http.ResponseWriter, r *http.Request, original []byte,
-	completionRequest map[string]any, uuidStr, transferID, prefillPodHostPort, kvCacheSource string,
+	body map[string]any, uuidStr, transferID, prefillPodHostPort, kvCacheSource string,
+	apiType reqcommon.APIType,
 ) {
 	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2 (concurrent dispatch)",
 		"url", prefillPodHostPort, "request_id", uuidStr)
@@ -557,28 +496,37 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	parentCtx := r.Context()
 	requestStartedAt := time.Now()
 
-	// Snapshot client fields before mutating completionRequest into the prefill
-	// body; they are restored when building the decode body.
-	streamValue, streamOk := completionRequest[requestFieldStream]
-	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
-	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
-	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
-	maxOutputTokensValue, maxOutputTokensOk := completionRequest[requestFieldMaxOutputTokens]
-	minTokensValue, minTokensOk := completionRequest[requestFieldMinTokens]
+	// Keeps the client's body intact for the decode request built below.
+	prefillRequest := maps.Clone(body)
 
-	// Pin both legs to the same DP rank (kv_transfer_params + HTTP header).
-	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
+	// Pin both requests to the same DP rank (kv_transfer_params + HTTP header).
+	// The header and remote_dp_rank must be in [0, dp_size_local).
+	dpLocal := s.config.MoRIIODPSizeLocal
+	if dpLocal <= 0 {
+		dpLocal = s.config.MoRIIODPSize
+	}
+	if dpLocal <= 0 {
+		dpLocal = 1
+	}
+	_, dpRank := pickDPRanks(
+		uuidStr,
+		s.config.MoRIIODPSize,
+		s.config.MoRIIODPSizeLocal,
+	)
+
+	decodePodIP := s.currentDecodePodIP(parentCtx)
+	decodeHosts := s.currentDecodeHosts(parentCtx)
 
 	// Build prefill body. remote_host points at the decode pod so prefill can
-	// RDMA-Write KV there; remote_dp_size gates the decode-side per-DP-rank
-	// handshake loop for Wide-EP.
-	completionRequest[requestFieldKVTransferParams] = map[string]any{
-		requestFieldDoRemoteDecode:       true,
-		requestFieldDoRemotePrefill:      false,
-		requestFieldRemoteEngineID:       nil,
-		requestFieldRemoteBlockIDs:       nil,
-		requestFieldRemoteHost:           s.currentDecodePodIP(parentCtx),
-		requestFieldRemotePort:           nil,
+	// RDMA-Write KV there; remote_dp_size stays global, gating the decode-side
+	// per-DP-rank handshake loop for Wide-EP.
+	prefillRequest[reqcommon.FieldKVTransferParams] = map[string]any{
+		reqcommon.FieldDoRemoteDecode:    true,
+		reqcommon.FieldDoRemotePrefill:   false,
+		reqcommon.FieldRemoteEngineID:    nil,
+		reqcommon.FieldRemoteBlockIDs:    nil,
+		reqcommon.FieldRemoteHost:        decodePodIP,
+		reqcommon.FieldRemotePort:        nil,
 		requestFieldRemoteNotifyPort:     s.config.MoRIIODecodeNotifyPort,
 		requestFieldRemoteDPRank:         dpRank,
 		requestFieldRemoteDPRankOverride: true,
@@ -587,12 +535,12 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		"tp_size":                        s.config.MoRIIOTPSize,
 		"remote_dp_size":                 s.config.MoRIIODPSize,
 	}
-	// Wide-EP fan-out (prefill leg): remote_hosts must be the DECODE-side pod
+	// Wide-EP fan-out (prefill request): remote_hosts must be the DECODE-side pod
 	// IPs so prefill handshakes the right pods. Omitted when unset, falling back
 	// to the single-host remote_host path. Re-resolved per request so peer
 	// restarts (new IP) are picked up within the TTL.
-	if decodeHosts := s.currentDecodeHosts(parentCtx); len(decodeHosts) > 0 {
-		pkv := completionRequest[requestFieldKVTransferParams].(map[string]any)
+	if len(decodeHosts) > 0 {
+		pkv := prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any)
 		hosts := make([]any, len(decodeHosts))
 		for i, h := range decodeHosts {
 			hosts[i] = h
@@ -602,17 +550,12 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 			pkv["remote_dp_size_local"] = s.config.MoRIIODPSizeLocal
 		}
 	}
-	// Compose the OffloadingConnector p2p pull onto the NIXL prefill leg.
-	s.addP2PPullToPrefill(completionRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
+	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
-	completionRequest[requestFieldStream] = false
-	delete(completionRequest, requestFieldStreamOptions)
-	completionRequest[requestFieldMaxTokens] = 1
-	completionRequest[requestFieldMaxCompletionTokens] = 1
-	completionRequest[requestFieldMaxOutputTokens] = 1
-	completionRequest[requestFieldMinTokens] = 1
+	reqcommon.CapSingleToken(prefillRequest, apiType)
 
-	pbody, err := json.Marshal(completionRequest)
+	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal P)")
@@ -621,71 +564,45 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	}
 
 	// ---------- Build decode body ----------
-	// Restore the client's streaming flags and token-limit fields.
-	delete(completionRequest, requestFieldStream)
-	if streamOk {
-		completionRequest[requestFieldStream] = streamValue
-	}
-	if streamOptionsOk {
-		completionRequest[requestFieldStreamOptions] = streamOptionsValue
-	}
-	delete(completionRequest, requestFieldMaxTokens)
-	if maxTokensOk {
-		completionRequest[requestFieldMaxTokens] = maxTokensValue
-	}
-	delete(completionRequest, requestFieldMaxCompletionTokens)
-	if maxCompletionTokensOk {
-		completionRequest[requestFieldMaxCompletionTokens] = maxCompletionTokensValue
-	}
-	delete(completionRequest, requestFieldMaxOutputTokens)
-	if maxOutputTokensOk {
-		completionRequest[requestFieldMaxOutputTokens] = maxOutputTokensValue
-	}
-	delete(completionRequest, requestFieldMinTokens)
-	if minTokensOk {
-		completionRequest[requestFieldMinTokens] = minTokensValue
-	}
-
-	// Synthesise decode-leg kv_transfer_params that the serial path would
+	// Synthesise decode-request kv_transfer_params that the serial path would
 	// otherwise read from the prefill response. do_remote_prefill must be true:
 	// it gates the decode-side send_notify_block that prefill's RDMA Write waits on.
 	prefillHost, _, splitErr := net.SplitHostPort(prefillPodHostPort)
 	if splitErr != nil {
 		prefillHost = prefillPodHostPort
 	}
+	remoteHosts := s.currentRemoteHosts(parentCtx)
 
-	completionRequest[requestFieldKVTransferParams] = map[string]any{
-		requestFieldDoRemotePrefill: true,
-		requestFieldDoRemoteDecode:  false,
-		requestFieldRemoteEngineID:  net.JoinHostPort(prefillHost, strconv.Itoa(s.config.MoRIIOPrefillHandshakePort)),
+	// Decode: one prefill host; leader bit for follower global ranks.
+	body[reqcommon.FieldKVTransferParams] = map[string]any{
+		reqcommon.FieldDoRemotePrefill: true,
+		reqcommon.FieldDoRemoteDecode:  false,
+		reqcommon.FieldRemoteEngineID:  net.JoinHostPort(prefillHost, strconv.Itoa(s.config.MoRIIOPrefillHandshakePort)),
 		// Empty (not nil) since decode allocates its own blocks in WRITE mode.
-		requestFieldRemoteBlockIDs:       []any{},
-		requestFieldRemoteHost:           prefillHost,
-		requestFieldRemotePort:           s.config.MoRIIOPrefillHandshakePort,
+		reqcommon.FieldRemoteBlockIDs:    []any{},
+		reqcommon.FieldRemoteHost:        prefillHost,
+		reqcommon.FieldRemotePort:        s.config.MoRIIOPrefillHandshakePort,
 		requestFieldRemoteNotifyPort:     s.config.MoRIIOPrefillNotifyPort,
 		requestFieldRemoteDPRank:         dpRank,
 		requestFieldRemoteDPRankOverride: true,
 		requestFieldRemoteHandshakePort:  s.config.MoRIIOPrefillHandshakePort,
 		requestFieldTransferID:           transferID,
 		"tp_size":                        s.config.MoRIIOTPSize,
-		"remote_dp_size":                 s.config.MoRIIODPSize,
+		"remote_dp_size":                 dpLocal,
+		"is_request_leader":              true,
 	}
-	// Wide-EP fan-out (decode leg): the opposite host list, the PREFILL-side
+	// Wide-EP fan-out (decode request): the opposite host list, the PREFILL-side
 	// pod IPs. A multi-pod deployment must set both host flags. Re-resolved per
 	// request so peer restarts (new IP) are picked up within the TTL.
-	if remoteHosts := s.currentRemoteHosts(parentCtx); len(remoteHosts) > 0 {
-		dkv := completionRequest[requestFieldKVTransferParams].(map[string]any)
-		hosts := make([]any, len(remoteHosts))
-		for i, h := range remoteHosts {
-			hosts[i] = h
-		}
-		dkv["remote_hosts"] = hosts
+	if len(remoteHosts) > 0 {
+		dkv := body[reqcommon.FieldKVTransferParams].(map[string]any)
+		dkv["remote_hosts"] = []any{prefillHost}
 		if s.config.MoRIIODPSizeLocal > 0 {
 			dkv["remote_dp_size_local"] = s.config.MoRIIODPSizeLocal
 		}
 	}
 
-	dbody, err := json.Marshal(completionRequest)
+	dbody, err := json.Marshal(body)
 	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal D)")
@@ -704,41 +621,41 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 
 	// Fire prefill and decode concurrently, but DEFER committing decode's
 	// response to the client until prefill's outcome is known (the commit
-	// point). Both legs share a cancelable context so a failed or hung prefill
+	// point). Both requests share a cancelable context so a failed or hung prefill
 	// aborts decode's in-flight request / KV wait immediately instead of
 	// letting it hang, and decode's output is buffered so a failed prefill can
 	// never surface a bogus 200 to the client.
 	dispatchCtx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
-	pCtx, prefillSpan := tracer.Start(dispatchCtx, "llm_d.pd_proxy.prefill",
+	pCtx, prefillSpan := tracer.Start(dispatchCtx, "prefill",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	prefillSpan.SetAttributes(
-		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
-		attribute.String("llm_d.pd_proxy.prefill_target", prefillPodHostPort),
-		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
-		attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+		semconv.LLMDPDProxyRequestID(uuidStr),
+		semconv.LLMDPDProxyPrefillTarget(prefillPodHostPort),
+		semconv.LLMDPDProxyConnector("nixlv2"),
+		semconv.LLMDPDProxyParallelDispatch(true),
 	)
 	preq := r.Clone(pCtx)
-	preq.Header.Set(requestHeaderRequestID, uuidStr)
+	preq.Header.Set(reqcommon.RequestIDHeaderKey, uuidStr)
 	if s.config.MoRIIODPSize > 1 {
 		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
 	}
 	preq.Body = io.NopCloser(bytes.NewReader(pbody))
 	preq.ContentLength = int64(len(pbody))
 
-	dCtx, decodeSpan := tracer.Start(dispatchCtx, "llm_d.pd_proxy.decode",
+	dCtx, decodeSpan := tracer.Start(dispatchCtx, "decode",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer decodeSpan.End()
 	decodeSpan.SetAttributes(
-		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
-		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
-		attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+		semconv.LLMDPDProxyRequestID(uuidStr),
+		semconv.LLMDPDProxyConnector("nixlv2"),
+		semconv.LLMDPDProxyParallelDispatch(true),
 	)
 	dreq := r.Clone(dCtx)
-	dreq.Header.Set(requestHeaderRequestID, uuidStr)
+	dreq.Header.Set(reqcommon.RequestIDHeaderKey, uuidStr)
 	if s.config.MoRIIODPSize > 1 {
 		dreq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
 	}
@@ -765,18 +682,32 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	go func() {
 		defer close(prefillDone)
 		defer prefillSpan.End()
+		// ErrAbortHandler is only recovered on the request goroutine.
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec != http.ErrAbortHandler {
+					panic(rec)
+				}
+				prefillSpan.SetStatus(codes.Error, "prefill handler aborted")
+				cancel()
+				s.logger.Error(nil, "concurrent-dispatch prefill handler aborted",
+					"request_id", uuidStr)
+			}
+		}()
 		pw := &bufferedResponseWriter{}
 		prefillHandler.ServeHTTP(pw, preq)
 		prefillResp = pw
+		prefillDuration := time.Since(prefillStartedAt)
+		metrics.RecordPrefillDuration(prefillDuration)
 		prefillSpan.SetAttributes(
-			attribute.Int("llm_d.pd_proxy.prefill.status_code", pw.statusCode),
-			attribute.Float64("llm_d.pd_proxy.prefill.duration_ms", float64(time.Since(prefillStartedAt).Milliseconds())),
+			semconv.LLMDPDProxyPrefillStatusCode(pw.statusCode),
+			semconv.LLMDPDProxyPrefillDurationMs(float64(prefillDuration.Milliseconds())),
 		)
 		if isHTTPError(pw.statusCode) {
 			prefillSpan.SetStatus(codes.Error, "prefill request failed")
 			cancel() // KV will never arrive -> abort decode instead of hanging
 			s.logger.Error(nil, "concurrent-dispatch prefill returned error status",
-				"status", pw.statusCode, "request_id", uuidStr, "body", pw.buffer.String())
+				"status", pw.statusCode, "request_id", uuidStr, logging.HTTPBodyKey, pw.buffer.String())
 		}
 	}()
 
@@ -785,15 +716,34 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// semantics but still route through the deferred writer.
 	decodeDone := make(chan struct{})
 	decodeStartedAt := time.Now()
+	// Swallowing the abort here keeps the process alive but hides the failure
+	// from the client, so record it and replay it on the request goroutine.
+	var decodeAborted atomic.Bool
+	// Written by the decode goroutine, read after decodeDone is closed.
+	var decodeDuration time.Duration
 	go func() {
 		defer close(decodeDone)
+		defer func() { decodeDuration = time.Since(decodeStartedAt) }()
+		// Same recover: abort this request, do not kill the process.
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec != http.ErrAbortHandler {
+					panic(rec)
+				}
+				decodeSpan.SetStatus(codes.Error, "decode handler aborted")
+				decodeAborted.Store(true)
+				dcw.abort()
+				s.logger.Error(nil, "concurrent-dispatch decode handler aborted",
+					"request_id", uuidStr)
+			}
+		}()
 		dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(dcw, dreq)
-		decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
+		decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDataParallel(dataParallelUsed))
 		if !dataParallelUsed {
-			decodeSpan.SetAttributes(attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host))
+			decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeTarget(s.config.DecoderURL.Host))
 			s.decoderProxy.ServeHTTP(dcw, dreq)
 		}
-		decodeSpan.SetAttributes(attribute.Float64("llm_d.pd_proxy.decode.duration_ms", float64(time.Since(decodeStartedAt).Milliseconds())))
+		decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDurationMs(float64(time.Since(decodeStartedAt).Milliseconds())))
 	}()
 
 	// Commit point: wait for prefill's outcome, bounded by a KV-wait backstop
@@ -804,6 +754,12 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	}
 	timer := time.NewTimer(waitTimeout)
 	defer timer.Stop()
+
+	// Set once this goroutine has written a terminal response of its own, so an
+	// aborted decode cannot write a second status over it.
+	clientResponded := false
+	// Set when the KV-wait timer fired; decode then ran for the full timeout.
+	decodeTimedOut := false
 
 	select {
 	case <-prefillDone:
@@ -818,6 +774,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		// Prefill failed: abort decode and return the prefill error verbatim.
 		cancel()
 		dcw.abort()
+		metrics.RecordError(metrics.StagePrefill)
 		status := http.StatusBadGateway
 		if prefillResp != nil {
 			status = prefillResp.statusCode
@@ -833,6 +790,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		}
 		s.logger.Info("concurrent-dispatch: prefill failed; returning prefill error and aborting decode",
 			"request_id", uuidStr, "p_status", status, "p_body_snippet", bodySnippet)
+		clientResponded = true
 		w.WriteHeader(status)
 		if prefillResp != nil {
 			if _, writeErr := w.Write(prefillResp.bodyBytes()); writeErr != nil {
@@ -840,12 +798,18 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 			}
 		}
 	case <-timer.C:
-		// Prefill did not resolve within the backstop window: cancel both legs
+		// Prefill did not resolve within the backstop window: cancel both requests
 		// and fail rather than hang waiting for KV that may never arrive.
 		cancel()
 		dcw.abort()
+		// Counted here rather than from prefill's own outcome: the cancelled
+		// prefill may still come back 2xx if it completed as the timer fired.
+		metrics.RecordError(metrics.StagePrefill)
+		decodeTimedOut = true
 		s.logger.Error(nil, "concurrent-dispatch: prefill did not complete within KV-wait timeout; aborting",
 			"request_id", uuidStr, "timeout", waitTimeout.String())
+		clientResponded = true
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGatewayTimeout)
 		if _, writeErr := w.Write([]byte(`{"error":"decode aborted: prefill did not complete within the MoRI-IO parallel-dispatch KV-wait timeout"}`)); writeErr != nil {
 			s.logger.Error(writeErr, "failed to send timeout error to client (concurrent-dispatch)")
@@ -857,6 +821,20 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// we never leak the decode goroutine or its response body.
 	<-decodeDone
 
+	// Decode errors are attributed only when the commit point let decode's
+	// response reach the client. When the commit point wrote the response
+	// itself (prefill error or KV-wait timeout), decode's output was discarded
+	// and the failure is counted as a prefill error. Decode duration is also
+	// sampled on the KV-wait timeout, where decode waited the full timeout.
+	if !clientResponded {
+		metrics.RecordDecodeDuration(decodeDuration)
+		if decodeAborted.Load() || dcw.failed() {
+			metrics.RecordError(metrics.StageDecode)
+		}
+	} else if decodeTimedOut {
+		metrics.RecordDecodeDuration(decodeDuration)
+	}
+
 	if currentSpan := trace.SpanFromContext(parentCtx); currentSpan.SpanContext().IsValid() {
 		var totalDuration time.Duration
 		if requestStartValue := parentCtx.Value(requestStartTimeKey); requestStartValue != nil {
@@ -865,12 +843,30 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 			}
 		}
 		currentSpan.SetAttributes(
-			attribute.Float64("llm_d.pd_proxy.total_duration_ms", float64(totalDuration.Milliseconds())),
-			attribute.Float64("llm_d.pd_proxy.parallel_window_ms", float64(time.Since(requestStartedAt).Milliseconds())),
-			attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+			semconv.LLMDPDProxyTotalDurationMs(float64(totalDuration.Milliseconds())),
+			semconv.LLMDPDProxyParallelWindowMs(float64(time.Since(requestStartedAt).Milliseconds())),
+			semconv.LLMDPDProxyParallelDispatch(true),
 		)
 	}
 	_ = original // kept for signature symmetry with the strictly-serial path
+
+	// Replay the decode abort here, on the request goroutine, so it reaches the
+	// client the way it does on the strictly-serial path. Skipped when the
+	// commit point already wrote the prefill error or the KV-wait timeout,
+	// which own the response.
+	if decodeAborted.Load() && !clientResponded {
+		if dcw.responseStarted() {
+			// Decode's response is already on the wire, so the status cannot be
+			// changed; net/http recovers this and drops the connection, leaving
+			// the client a truncated stream rather than a clean terminator.
+			panic(http.ErrAbortHandler)
+		}
+		// Nothing was relayed, so the response is still ours to write. Returning
+		// without one would let net/http synthesise an empty 200.
+		if err := errorBadGateway(errDecodeAborted, w); err != nil {
+			s.logger.Error(err, "failed to send decode abort error to client (concurrent-dispatch)")
+		}
+	}
 }
 
 // truncate shortens s to at most n characters, appending "..." if truncated.

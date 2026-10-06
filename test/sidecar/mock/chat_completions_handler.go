@@ -51,9 +51,9 @@ type ChatCompletionHandler struct {
 	// sidecar populates when --moriio-write-mode is enabled.  Standard NIXLv2
 	// READ-mode validation (everything nil) still applies when this is false.
 	MoRIIOWriteMode bool
-	// BidirectionalKVMode allows non-nil remote_engine_id and remote_block_ids
-	// in prefill requests, which the sidecar injects from cached decode responses
-	// when bidirectional KV transfer is enabled.
+	// BidirectionalKVMode lets a NIXLv2 prefill request carry the decode-side
+	// remote_engine_id, remote_block_ids, remote_host and remote_port that
+	// bidirectional KV transfer replays from the previous turn.
 	BidirectionalKVMode bool
 	RequestCount        atomic.Int32
 	CompletionRequests  []map[string]any
@@ -104,17 +104,17 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	defer r.Body.Close() //nolint:all
+	defer r.Body.Close() //nolint:errcheck
 	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest) // TODO: check FastAPI error code when failing to read body
-		w.Write([]byte(err.Error()))         //nolint:all
+		_, _ = w.Write([]byte(err.Error()))
 		return
 	}
 
 	var completionRequest map[string]any
 	if err := json.Unmarshal(b, &completionRequest); err != nil {
-		w.Write([]byte(err.Error())) //nolint:all
+		_, _ = w.Write([]byte(err.Error()))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -139,39 +139,35 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 			if !ok || kvTransferParams == nil {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				_, _ = w.Write([]byte("expected kv_transfer_params:{...}"))
 				return
 			}
 			kvTransferParamsMap, ok := kvTransferParams.(map[string]any)
 			if !ok {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 
 			if v, ok := kvTransferParamsMap["do_remote_decode"]; !ok || !v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_decode:true")) //nolint:all
+				w.Write([]byte("expected do_remote_decode:true")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["do_remote_prefill"]; !ok || v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_prefill:false")) //nolint:all
+				w.Write([]byte("expected do_remote_prefill:false")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
-			// Bidirectional KV mode allows non-nil remote_engine_id and remote_block_ids
-			// from cached decode responses (D→P transfer)
-			if !cc.BidirectionalKVMode {
-				if v, ok := kvTransferParamsMap["remote_engine_id"]; !ok || v != nil {
-					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_engine_id:null")) //nolint:all
-					return
-				}
-				if v, ok := kvTransferParamsMap["remote_block_ids"]; !ok || v != nil {
-					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_block_ids:null")) //nolint:all
-					return
-				}
+			if v, ok := kvTransferParamsMap["remote_engine_id"]; !cc.BidirectionalKVMode && (!ok || v != nil) {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte("expected remote_engine_id:null")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
+				return
+			}
+			if v, ok := kvTransferParamsMap["remote_block_ids"]; !cc.BidirectionalKVMode && (!ok || v != nil) {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte("expected remote_block_ids:null")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
+				return
 			}
 			if cc.MoRIIOWriteMode {
 				// WRITE-mode expectations: remote_host is a non-empty string
@@ -180,47 +176,43 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 				v, ok := kvTransferParamsMap["remote_host"]
 				if !ok {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_host:<host>")) //nolint:all
+					w.Write([]byte("expected remote_host:<host>")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				}
 				if s, isStr := v.(string); !isStr || s == "" {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_host to be a non-empty string in WRITE mode")) //nolint:all
+					w.Write([]byte("expected remote_host to be a non-empty string in WRITE mode")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				}
 				if v, ok := kvTransferParamsMap["remote_notify_port"]; !ok {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_notify_port:<int> in WRITE mode")) //nolint:all
+					w.Write([]byte("expected remote_notify_port:<int> in WRITE mode")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				} else if _, isNum := v.(float64); !isNum {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_notify_port to be a number in WRITE mode")) //nolint:all
+					w.Write([]byte("expected remote_notify_port to be a number in WRITE mode")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				}
 				if v, ok := kvTransferParamsMap["transfer_id"]; !ok {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected transfer_id:<uuid> in WRITE mode")) //nolint:all
+					w.Write([]byte("expected transfer_id:<uuid> in WRITE mode")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				} else if s, isStr := v.(string); !isStr || s == "" {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected transfer_id to be a non-empty string in WRITE mode")) //nolint:all
+					w.Write([]byte("expected transfer_id to be a non-empty string in WRITE mode")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				}
 			} else if !cc.BidirectionalKVMode {
-				// Standard NIXLv2 READ-mode: remote_host and remote_port must be nil
-				// (bidirectional KV mode allows these from cached decode responses)
 				if v, ok := kvTransferParamsMap["remote_host"]; !ok || v != nil {
 					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_host:null")) //nolint:all
+					w.Write([]byte("expected remote_host:null")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 					return
 				}
 			}
-			if !cc.BidirectionalKVMode {
-				if v, ok := kvTransferParamsMap["remote_port"]; !ok || v != nil {
-					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte("expected remote_port:null")) //nolint:all
-					return
-				}
+			if v, ok := kvTransferParamsMap["remote_port"]; !cc.BidirectionalKVMode && (!ok || v != nil) {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte("expected remote_port:null")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
+				return
 			}
 
 			// 2. Produce Response
@@ -235,38 +227,38 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			kvTransferParams, ok := completionRequest["kv_transfer_params"]
 			if !ok || kvTransferParams == nil {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			kvTransferParamsMap, ok := kvTransferParams.(map[string]any)
 			if !ok {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["do_remote_prefill"]; !ok || !v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_prefill:true")) //nolint:all
+				w.Write([]byte("expected do_remote_prefill:true")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["do_remote_decode"]; !ok || v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_decode:false")) //nolint:all
+				w.Write([]byte("expected do_remote_decode:false")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["transfer_id"]; !ok || v == nil || v == "" {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected transfer_id to be non-empty")) //nolint:all
+				w.Write([]byte("expected transfer_id to be non-empty")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["remote_bootstrap_addr"]; !ok || v == nil || v == "" {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected remote_bootstrap_addr to be non-empty")) //nolint:all
+				w.Write([]byte("expected remote_bootstrap_addr to be non-empty")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["remote_engine_id"]; !ok || v == nil || v == "" {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected remote_engine_id to be non-empty")) //nolint:all
+				w.Write([]byte("expected remote_engine_id to be non-empty")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			rawResponse = `{"id":"chatcmpl-test","object":"chat.completion","choices":[],"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65}}`
@@ -274,28 +266,28 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			kvTransferParams, ok := completionRequest["kv_transfer_params"]
 			if !ok || kvTransferParams == nil {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			kvTransferParamsMap, ok := kvTransferParams.(map[string]any)
 			if !ok {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:all
+				w.Write([]byte("expected kv_transfer_params:{...}")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["do_remote_decode"]; !ok || !v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_decode:true")) //nolint:all
+				w.Write([]byte("expected do_remote_decode:true")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["do_remote_prefill"]; !ok || v.(bool) {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected do_remote_prefill:false")) //nolint:all
+				w.Write([]byte("expected do_remote_prefill:false")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			if v, ok := kvTransferParamsMap["transfer_id"]; !ok || v == nil || v == "" {
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte("expected transfer_id to be non-empty")) //nolint:all
+				w.Write([]byte("expected transfer_id to be non-empty")) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 				return
 			}
 			rawResponse = `{}`
@@ -321,7 +313,7 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	if cc.RawResponseType != contentTypeEventStream {
 		if err := json.Unmarshal([]byte(rawResponse), &completionResponse); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(err.Error())) //nolint:all
+			w.Write([]byte(err.Error())) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 			return
 		}
 		cc.mu.Lock()
@@ -329,5 +321,5 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		cc.mu.Unlock()
 	}
 
-	w.Write([]byte(rawResponse)) //nolint:all
+	w.Write([]byte(rawResponse)) //nolint:errcheck,gosec // G104: error not actionable on test handler response
 }

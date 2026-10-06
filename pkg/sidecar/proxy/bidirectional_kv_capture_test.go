@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The llm-d Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,221 +17,125 @@ limitations under the License.
 package proxy
 
 import (
-	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestKVTransferParamsCapture_NonStreaming(t *testing.T) {
-	tests := []struct {
-		name           string
-		responseBody   string
-		expectedParams map[string]any
-	}{
-		{
-			name: "extracts kv_transfer_params from non-streaming response",
-			responseBody: `{
-				"id": "chatcmpl-123",
-				"usage": {"prompt_tokens": 100, "completion_tokens": 10},
-				"kv_transfer_params": {
-					"remote_block_ids": [[1, 2, 3]],
-					"remote_engine_id": "engine-abc",
-					"remote_host": "10.0.1.42",
-					"remote_port": 5678
-				}
-			}`,
-			expectedParams: map[string]any{
-				"remote_block_ids": []any{[]any{float64(1), float64(2), float64(3)}},
-				"remote_engine_id": "engine-abc",
-				"remote_host":      "10.0.1.42",
-				"remote_port":      float64(5678),
-			},
-		},
-		{
-			name: "returns nil when kv_transfer_params absent",
-			responseBody: `{
-				"id": "chatcmpl-123",
-				"usage": {"prompt_tokens": 100, "completion_tokens": 10}
-			}`,
-			expectedParams: nil,
-		},
-		{
-			name:           "returns nil for empty response",
-			responseBody:   "",
-			expectedParams: nil,
-		},
-		{
-			name:           "returns nil for invalid JSON",
-			responseBody:   `{invalid json}`,
-			expectedParams: nil,
-		},
+const captureKVFrame = `{"id":"c","choices":[],"kv_transfer_params":{"do_remote_prefill":false,"do_remote_decode":true,` +
+	`"remote_block_ids":[[7,8]],"remote_engine_id":"e","remote_request_id":"r","remote_host":"h","remote_port":4032,"remote_num_tokens":96}}`
+
+func sseFrames(frames ...string) string {
+	var b strings.Builder
+	for _, f := range frames {
+		b.WriteString("data: " + f + "\n\n")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			writer, finalize := newKVTransferParamsCaptureWriter(recorder)
-
-			n, err := writer.Write([]byte(tt.responseBody))
-			require.NoError(t, err)
-			assert.Equal(t, len(tt.responseBody), n)
-
-			captured := finalize()
-			if tt.expectedParams == nil {
-				assert.Nil(t, captured)
-			} else {
-				assert.Equal(t, tt.expectedParams, captured)
-			}
-
-			assert.Equal(t, tt.responseBody, recorder.Body.String(), "response body should be unchanged")
-		})
-	}
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
 }
 
-func TestKVTransferParamsCapture_Streaming(t *testing.T) {
-	tests := []struct {
-		name           string
-		chunks         []string
-		expectedParams map[string]any
-	}{
-		{
-			name: "extracts kv_transfer_params from final SSE chunk",
-			chunks: []string{
-				"data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-				"data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
-				"data: {\"id\":\"chatcmpl-123\",\"usage\":{\"prompt_tokens\":100},\"kv_transfer_params\":{\"remote_block_ids\":[[1,2]],\"remote_engine_id\":\"engine-xyz\"}}\n\n",
-				"data: [DONE]\n\n",
-			},
-			expectedParams: map[string]any{
-				"remote_block_ids": []any{[]any{float64(1), float64(2)}},
-				"remote_engine_id": "engine-xyz",
-			},
-		},
-		{
-			name: "updates to last-seen kv_transfer_params when multiple chunks have it",
-			chunks: []string{
-				"data: {\"kv_transfer_params\":{\"remote_engine_id\":\"first\"}}\n\n",
-				"data: {\"kv_transfer_params\":{\"remote_engine_id\":\"second\"}}\n\n",
-			},
-			expectedParams: map[string]any{
-				"remote_engine_id": "second",
-			},
-		},
-		{
-			name: "returns nil when no chunks contain kv_transfer_params",
-			chunks: []string{
-				"data: {\"id\":\"chatcmpl-123\",\"choices\":[{\"delta\":{\"content\":\"test\"}}]}\n\n",
-				"data: [DONE]\n\n",
-			},
-			expectedParams: nil,
-		},
-		{
-			name: "handles chunks split mid-line",
-			chunks: []string{
-				"data: {\"kv_transfer_params\":{\"remote_",
-				"engine_id\":\"split-line\"}}\n\n",
-			},
-			expectedParams: map[string]any{
-				"remote_engine_id": "split-line",
-			},
-		},
-		{
-			name:           "returns nil for empty stream",
-			chunks:         []string{},
-			expectedParams: nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			recorder.Header().Set("Content-Type", "text/event-stream")
-			writer, finalize := newKVTransferParamsCaptureWriter(recorder)
-
-			var expectedBody bytes.Buffer
-			for _, chunk := range tt.chunks {
-				n, err := writer.Write([]byte(chunk))
-				require.NoError(t, err)
-				assert.Equal(t, len(chunk), n)
-				expectedBody.WriteString(chunk)
-			}
-
-			captured := finalize()
-			if tt.expectedParams == nil {
-				assert.Nil(t, captured)
-			} else {
-				assert.Equal(t, tt.expectedParams, captured)
-			}
-
-			assert.Equal(t, expectedBody.String(), recorder.Body.String(), "response body should be unchanged")
-		})
-	}
-}
-
-func TestKVTransferParamsCapture_DetectsSSEMode(t *testing.T) {
-	t.Run("detects SSE from Content-Type header", func(t *testing.T) {
-		recorder := httptest.NewRecorder()
-		recorder.Header().Set("Content-Type", "text/event-stream")
-		writer, finalize := newKVTransferParamsCaptureWriter(recorder)
-
-		_, err := writer.Write([]byte("data: {\"kv_transfer_params\":{\"remote_engine_id\":\"test\"}}\n\n"))
+func captureSSE(t *testing.T, stream string, chunk int) (*httptest.ResponseRecorder, *decodeCapture) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/event-stream")
+	w, c := newDecodeCapture(rec)
+	flusher, ok := w.(http.Flusher)
+	require.True(t, ok, "the capture must keep the underlying writer's http.Flusher")
+	for i := 0; i < len(stream); i += chunk {
+		end := min(i+chunk, len(stream))
+		_, err := w.Write([]byte(stream[i:end]))
 		require.NoError(t, err)
-		captured := finalize()
-
-		assert.NotNil(t, captured)
-		assert.Equal(t, "test", captured["remote_engine_id"])
-	})
-
-	t.Run("detects SSE from data: prefix", func(t *testing.T) {
-		recorder := httptest.NewRecorder()
-		writer, finalize := newKVTransferParamsCaptureWriter(recorder)
-
-		_, err := writer.Write([]byte("data: {\"kv_transfer_params\":{\"remote_engine_id\":\"test\"}}\n\n"))
-		require.NoError(t, err)
-		captured := finalize()
-
-		assert.NotNil(t, captured)
-		assert.Equal(t, "test", captured["remote_engine_id"])
-	})
-
-	t.Run("treats response as non-streaming without SSE indicators", func(t *testing.T) {
-		recorder := httptest.NewRecorder()
-		writer, finalize := newKVTransferParamsCaptureWriter(recorder)
-
-		_, err := writer.Write([]byte(`{"kv_transfer_params":{"remote_engine_id":"test"}}`))
-		require.NoError(t, err)
-		captured := finalize()
-
-		assert.NotNil(t, captured)
-		assert.Equal(t, "test", captured["remote_engine_id"])
-	})
-}
-
-func TestKVTransferParamsCapture_PreservesHTTPInterfaces(t *testing.T) {
-	t.Run("preserves http.Flusher interface", func(t *testing.T) {
-		recorder := httptest.NewRecorder()
-		writer, _ := newKVTransferParamsCaptureWriter(recorder)
-
-		flusher, ok := writer.(http.Flusher)
-		require.True(t, ok, "should preserve http.Flusher interface")
 		flusher.Flush()
+	}
+	return rec, c
+}
+
+func TestDecodeCaptureStreamedContentAndToolCalls(t *testing.T) {
+	stream := sseFrames(
+		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"lo"}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"other","arguments":"{}"}}]}}]}`,
+		captureKVFrame,
+	)
+
+	// Seven bytes per write splits frames and lines at arbitrary points.
+	rec, c := captureSSE(t, stream, 7)
+	require.Equal(t, stream, rec.Body.String(), "the stream is forwarded unchanged")
+	require.True(t, rec.Flushed)
+
+	params, reply, ok := c.result()
+	require.True(t, ok)
+	require.Equal(t, "Hello", reply["content"])
+	require.Equal(t, []any{
+		map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"q":1}`}},
+		map[string]any{"id": "call_2", "type": "function", "function": map[string]any{"name": "other", "arguments": `{}`}},
+	}, reply["tool_calls"])
+	require.Equal(t, "e", params["remote_engine_id"])
+	require.Equal(t, json.Number("4032"), params["remote_port"], "numbers replay as written")
+}
+
+func TestDecodeCaptureStreamForwardsBeforeTheStreamEnds(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/event-stream")
+	w, _ := newDecodeCapture(rec)
+
+	first := "data: " + `{"choices":[{"index":0,"delta":{"content":"a"}}]}` + "\n\n"
+	_, err := w.Write([]byte(first))
+	require.NoError(t, err)
+	require.Equal(t, first, rec.Body.String(), "the first chunk reaches the client before the stream ends")
+}
+
+func TestDecodeCaptureNonStreamingResponse(t *testing.T) {
+	body := `{"choices":[{"index":0,"message":{"role":"assistant","content":"Hi","tool_calls":[` +
+		`{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],` +
+		`"kv_transfer_params":{"do_remote_decode":true,"remote_block_ids":[[1]],"remote_engine_id":"e","remote_request_id":"r","remote_host":"h","remote_port":1}}`
+	params, reply, ok := captureJSON(t, []byte(body)).result()
+	require.True(t, ok)
+	require.Equal(t, "Hi", reply["content"])
+	require.Len(t, reply["tool_calls"], 1)
+	require.Equal(t, "r", params["remote_request_id"])
+}
+
+func TestDecodeCaptureRejectsResponsesItCannotReduceToOneMessage(t *testing.T) {
+	t.Run("a second choice", func(t *testing.T) {
+		stream := sseFrames(
+			`{"choices":[{"index":0,"delta":{"content":"a"}},{"index":1,"delta":{"content":"b"}}]}`,
+			captureKVFrame,
+		)
+		_, c := captureSSE(t, stream, 64)
+		_, _, ok := c.result()
+		require.False(t, ok)
 	})
-
-	t.Run("preserves http.ResponseWriter interface", func(t *testing.T) {
-		recorder := httptest.NewRecorder()
-		writer, _ := newKVTransferParamsCaptureWriter(recorder)
-
-		writer.WriteHeader(http.StatusOK)
-		writer.Header().Set("X-Test", "value")
-		_, err := writer.Write([]byte("test"))
+	t.Run("a data frame that is not JSON", func(t *testing.T) {
+		_, c := captureSSE(t, sseFrames(`{"choices":[{"index":0,"delta":{"content":"a"}}]}`, `{not json`, captureKVFrame), 64)
+		_, _, ok := c.result()
+		require.False(t, ok)
+	})
+	t.Run("no kv_transfer_params", func(t *testing.T) {
+		_, c := captureSSE(t, sseFrames(`{"choices":[{"index":0,"delta":{"content":"a"}}]}`), 64)
+		_, _, ok := c.result()
+		require.False(t, ok)
+	})
+	t.Run("a non-streaming body that is not JSON", func(t *testing.T) {
+		w, c := newDecodeCapture(httptest.NewRecorder())
+		_, err := w.Write([]byte("upstream exploded"))
 		require.NoError(t, err)
-
-		assert.Equal(t, http.StatusOK, recorder.Code)
-		assert.Equal(t, "value", recorder.Header().Get("X-Test"))
-		assert.Equal(t, "test", recorder.Body.String())
+		_, _, ok := c.result()
+		require.False(t, ok)
 	})
+}
+
+func TestDecodeCaptureIgnoresSSEComments(t *testing.T) {
+	stream := ": keep-alive\n\n" + sseFrames(`{"choices":[{"index":0,"delta":{"content":"a"}}]}`, captureKVFrame)
+	_, c := captureSSE(t, stream, 5)
+	_, reply, ok := c.result()
+	require.True(t, ok)
+	require.Equal(t, "a", reply["content"])
 }

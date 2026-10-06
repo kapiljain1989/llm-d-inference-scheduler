@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +23,11 @@ import (
 	attrtopology "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/topology"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/disagg"
 )
+
+// PeerEndpointDataKey is the request-attribute key PeerTopology reads. Plugins
+// that call PeerTopology name it in Consumes() through this alias rather than
+// importing the profile-handler package for a key.
+var PeerEndpointDataKey = disagg.PeerEndpointAttributeKey
 
 // PeerTopology returns the topology of the endpoint selected in the peer
 // scheduling phase, or false when no peer topology is available.

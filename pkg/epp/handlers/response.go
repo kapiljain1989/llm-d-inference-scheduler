@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -72,7 +73,7 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 	}
 
 	var parsedResp *fwkrh.ParsedResponse
-	parser, err := s.getOrResolveParser(ctx, reqCtx)
+	parser, err := s.getOrResolveParser(reqCtx)
 	if err != nil {
 		logger.Error(err, "parsing response: failed to resolve parser")
 	} else {

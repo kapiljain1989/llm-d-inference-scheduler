@@ -80,9 +80,9 @@ func newDecodeProxyRequest(ctx context.Context, logger logr.Logger, step string,
 		v.Info("request body", "method", "POST", "path", reqCtx.OriginalPath, "bodyLen", len(bodyBytes), "headers", httplog.RedactedHeaders(proxyReq.Header))
 	}
 
-	// The decode leg is proxied straight to the gateway and never passes through
+	// The decode request is proxied straight to the gateway and never passes through
 	// gateway.Client.Request, which is what logs full request bodies at TRACE for
-	// the prefill and encode legs. Log the redacted body here so the decode leg's
+	// the prefill and encode requests. Log the redacted body here so the decode request's
 	// fields (min_tokens, max_tokens, ...) are observable at the same verbosity.
 	if v := logger.V(logutil.TRACE); v.Enabled() {
 		v.Info("request body", "method", "POST", "path", reqCtx.OriginalPath, "headers", httplog.RedactedHeaders(proxyReq.Header), logutil.HTTPBodyKey, gateway.RedactBody(bodyBytes))
@@ -117,7 +117,7 @@ type decodeOutcome struct {
 func newDecodeProxy(logger logr.Logger, transport http.RoundTripper, modifyResponse func(*http.Response) error) (*httputil.ReverseProxy, *decodeOutcome) {
 	out := &decodeOutcome{}
 	proxy := &httputil.ReverseProxy{
-		Director:      func(_ *http.Request) {},
+		Director:      func(_ *http.Request) {}, //nolint:staticcheck // SA1019: Rewrite does not append X-Forwarded-For, which Director does.
 		FlushInterval: -1,
 		Transport:     transport,
 		ModifyResponse: func(resp *http.Response) error {
@@ -149,6 +149,28 @@ func newDecodeProxy(logger logr.Logger, transport http.RoundTripper, modifyRespo
 		},
 	}
 	return proxy, out
+}
+
+// serveDecode wraps transport with instrumentedTransport itself, so callers
+// pass the raw transport. Passing an already instrumented one counts the call
+// twice in upstream_request_total.
+func serveDecode(logger logr.Logger, transport http.RoundTripper, w http.ResponseWriter, proxyReq *http.Request,
+	upstream string, modifyResponse func(*http.Response) error) *decodeOutcome {
+	proxy, out := newDecodeProxy(logger, instrumentedTransport(transport, upstream), modifyResponse)
+	proxy.ServeHTTP(w, proxyReq)
+	return out
+}
+
+// streamedError converts a decode outcome to the error its step returns. A
+// TransportErr takes precedence over a recorded Status.
+func (o *decodeOutcome) streamedError(step string) error {
+	if o.TransportErr != nil {
+		return &pipeline.UpstreamStreamedError{Step: step, Cause: o.TransportErr}
+	}
+	if o.Status >= http.StatusBadRequest {
+		return &pipeline.UpstreamStreamedError{Step: step, StatusCode: o.Status}
+	}
+	return nil
 }
 
 // proxyErrorLogWriter adapts the reverse proxy's *log.Logger sink to the

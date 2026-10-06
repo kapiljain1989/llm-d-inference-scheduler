@@ -60,6 +60,7 @@ const (
 	LLMDEPPProfileHandlerTotalProfilesKey    = attribute.Key("llm_d.epp.profile_handler.total_profiles")
 	LLMDEPPProfileHandlerExecutedProfilesKey = attribute.Key("llm_d.epp.profile_handler.executed_profiles")
 	LLMDEPPProfileHandlerDecodeFailedKey     = attribute.Key("llm_d.epp.profile_handler.decode_failed")
+	LLMDEPPProfileHandlerPrefillFailedKey    = attribute.Key("llm_d.epp.profile_handler.prefill_failed")
 
 	// EPP Producer attributes
 	LLMDEPPProducerCandidateEndpointsKey = attribute.Key("llm_d.epp.producer.candidate_endpoints")
@@ -149,6 +150,10 @@ const (
 	LLMDECProxyEncodeDisaggregationUsedKey = attribute.Key("llm_d.ec_proxy.encode_disaggregation_used")
 	LLMDECProxyEncoderCountKey             = attribute.Key("llm_d.ec_proxy.encoder_count")
 	LLMDECProxyEncoderCandidatesKey        = attribute.Key("llm_d.ec_proxy.encoder_candidates")
+
+	// Coordinator pipeline attributes
+	LLMDCoordinatorPipelineStepCountKey     = attribute.Key("llm_d.coordinator.pipeline.step_count")
+	LLMDCoordinatorPipelineExecutionPathKey = attribute.Key("llm_d.coordinator.pipeline.execution_path")
 
 	// OpenAI API attributes
 	LLMDOpenAIAPIKey = attribute.Key("llm_d.openai.api")
@@ -280,6 +285,11 @@ func LLMDEPPProfileHandlerExecutedProfiles(executed int) attribute.KeyValue {
 // LLMDEPPProfileHandlerDecodeFailed returns an attribute indicating whether decode execution failed.
 func LLMDEPPProfileHandlerDecodeFailed(failed bool) attribute.KeyValue {
 	return LLMDEPPProfileHandlerDecodeFailedKey.Bool(failed)
+}
+
+// LLMDEPPProfileHandlerPrefillFailed returns an attribute indicating whether a required prefill execution failed.
+func LLMDEPPProfileHandlerPrefillFailed(failed bool) attribute.KeyValue {
+	return LLMDEPPProfileHandlerPrefillFailedKey.Bool(failed)
 }
 
 // EPP Disagg helpers
@@ -719,6 +729,18 @@ func LLMDECProxyEncoderCount(count int) attribute.KeyValue {
 // LLMDECProxyEncoderCandidates returns an attribute for candidate encoder count in EC proxy.
 func LLMDECProxyEncoderCandidates(candidates int) attribute.KeyValue {
 	return LLMDECProxyEncoderCandidatesKey.Int(candidates)
+}
+
+// Coordinator pipeline helpers
+
+// LLMDCoordinatorPipelineStepCount returns an attribute for the number of steps configured in the pipeline.
+func LLMDCoordinatorPipelineStepCount(count int) attribute.KeyValue {
+	return LLMDCoordinatorPipelineStepCountKey.Int(count)
+}
+
+// LLMDCoordinatorPipelineExecutionPath returns an attribute for the step combination a request took.
+func LLMDCoordinatorPipelineExecutionPath(path string) attribute.KeyValue {
+	return LLMDCoordinatorPipelineExecutionPathKey.String(path)
 }
 
 // OpenAI API helpers

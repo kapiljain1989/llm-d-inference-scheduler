@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package disagg
 
 import (
@@ -56,6 +72,7 @@ var (
 	_ deciderPlugin           = &PrefixBasedPDDecider{}
 	_ fwkrc.PreRequest        = &PrefixBasedPDDecider{}
 	_ plugin.ConsumerPlugin   = &PrefixBasedPDDecider{}
+	_ plugin.ProducerPlugin   = &PrefixBasedPDDecider{}
 	_ prefixMatchInfoConsumer = &PrefixBasedPDDecider{}
 )
 
@@ -139,6 +156,17 @@ func (d *PrefixBasedPDDecider) TypedName() plugin.TypedName {
 func (d *PrefixBasedPDDecider) WithName(name string) *PrefixBasedPDDecider {
 	d.typedName.Name = name
 	return d
+}
+
+// Produces declares the request attributes the plugin writes: the
+// conditional-decode ownership marker the director reads to decide whether the
+// "Prefer: if-available" header was evaluated, and the memoized remote-prefill
+// outcome this plugin reads back in PreRequest.
+func (d *PrefixBasedPDDecider) Produces() map[plugin.DataKey]any {
+	return map[plugin.DataKey]any{
+		fwkrc.ConditionalDecodeHandledAttributeKey: false,
+		remotePrefillDecisionAttributeKey:          remotePrefillDecision{},
+	}
 }
 
 // Consumes declares the request- and endpoint-scoped data the plugin reads
