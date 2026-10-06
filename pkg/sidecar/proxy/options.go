@@ -106,10 +106,12 @@ const (
 	defaultP2PConnectorPort      = 7777
 
 	// defaultBidirectionalSessionHeader is the EPP session-affinity plugin's default header.
-	defaultBidirectionalSessionHeader = "x-session-token"
+	defaultBidirectionalSessionHeader = routing.SessionTokenHeader
 	defaultBidirectionalCacheSize     = 4096
-	// defaultBidirectionalCacheTTL is vLLM's default decoder_kv_blocks_ttl.
-	defaultBidirectionalCacheTTL = 480 * time.Second
+	// defaultBidirectionalCacheTTL leaves 30 seconds below vLLM's default
+	// decoder_kv_blocks_ttl (480 seconds), which starts when the decode request
+	// finishes, before the sidecar stores the entry.
+	defaultBidirectionalCacheTTL = 450 * time.Second
 
 	// defaultMoRIIOParallelDecodeWaitTimeout backstops the parallel WRITE
 	// dispatch: it bounds how long the decode request waits on the prefill outcome
@@ -153,6 +155,11 @@ type yamlConfiguration struct {
 	Tracing                 *bool    `json:"tracing,omitempty"`
 	MetricsPort             int      `json:"metrics-port,omitempty"`
 	MetricsCertDir          string   `json:"metrics-cert-dir,omitempty"`
+
+	EnableBidirectionalKVXfer  *bool  `json:"enable-bidirectional-kv-xfer,omitempty"`
+	BidirectionalSessionHeader string `json:"bidirectional-session-header,omitempty"`
+	BidirectionalCacheSize     int    `json:"bidirectional-cache-size,omitempty"`
+	BidirectionalCacheTTL      string `json:"bidirectional-cache-ttl,omitempty"`
 }
 
 // Options holds the CLI-facing configuration for the pd-sidecar proxy.
@@ -325,7 +332,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.BidirectionalCacheSize, bidirectionalCacheSize, opts.BidirectionalCacheSize,
 		"maximum number of conversation turns whose decode-side KV blocks are kept for a follow-up request (only used with --enable-bidirectional-kv-xfer)")
 	fs.DurationVar(&opts.BidirectionalCacheTTL, bidirectionalCacheTTL, opts.BidirectionalCacheTTL,
-		"how long a conversation turn's decode-side KV blocks stay usable; must not exceed the engine's decoder_kv_blocks_ttl (only used with --enable-bidirectional-kv-xfer)")
+		"how long a conversation turn's decode-side KV blocks stay usable; must stay below the engine's decoder_kv_blocks_ttl (only used with --enable-bidirectional-kv-xfer)")
 
 	// MoRI-IO WRITE-mode flags. Only meaningful with --kv-connector=nixlv2
 	// against vLLM engines running MoRI-IO in WRITE mode.
@@ -960,6 +967,24 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.Tracing != nil && !opts.isFlagSet(tracingFlag) {
 		opts.Tracing = *cfg.Tracing
+	}
+	if cfg.EnableBidirectionalKVXfer != nil && !opts.isFlagSet(enableBidirectionalKVXfer) {
+		opts.BidirectionalKVXfer = *cfg.EnableBidirectionalKVXfer
+	}
+	if cfg.BidirectionalSessionHeader != "" && !opts.isFlagSet(bidirectionalSessionHeader) {
+		opts.BidirectionalSessionHeader = cfg.BidirectionalSessionHeader
+	}
+	if cfg.BidirectionalCacheSize != 0 && !opts.isFlagSet(bidirectionalCacheSize) {
+		opts.BidirectionalCacheSize = cfg.BidirectionalCacheSize
+	}
+	if cfg.BidirectionalCacheTTL != "" && !opts.isFlagSet(bidirectionalCacheTTL) {
+		d, err := time.ParseDuration(cfg.BidirectionalCacheTTL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: ignoring invalid %s value %q: %v; using default %v\n",
+				bidirectionalCacheTTL, cfg.BidirectionalCacheTTL, err, opts.BidirectionalCacheTTL)
+		} else {
+			opts.BidirectionalCacheTTL = d
+		}
 	}
 }
 

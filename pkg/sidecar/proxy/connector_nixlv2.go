@@ -136,7 +136,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 			requestFieldRemoteDPRankOverride: true,
 			requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
 			requestFieldTransferID:           transferID,
-			"tp_size":                        s.config.MoRIIOTPSize,
+			requestFieldTPSize:               s.config.MoRIIOTPSize,
 			"remote_dp_size":                 s.config.MoRIIODPSize,
 		}
 		// Wide-EP fan-out (prefill request, serial path): remote_hosts must be the
@@ -170,8 +170,10 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// engine's MultiConnector takes the first connector that reports a hit and
 	// applies kv_recompute_threshold to the NIXL read itself.
 	reuse := s.newKVReuse(r, body, apiType)
+	replayed := false
 	if reuse != nil {
 		if cached := reuse.take(); cached != nil {
+			replayed = true
 			injectBidirectionalKVParams(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), cached)
 			s.logger.V(logging.DEBUG).Info("replaying decode-side kv_transfer_params", "request_id", uuidStr)
 		}
@@ -215,6 +217,14 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	var pw *bufferedResponseWriter
 retryLoop:
 	for attempt := 0; ; attempt++ {
+		if attempt > 0 && replayed {
+			// The failed attempt may have read and released the decode-side blocks.
+			dropBidirectionalKVParams(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any))
+			if b, err := json.Marshal(prefillRequest); err == nil {
+				pbody = b
+			}
+			replayed = false
+		}
 		pw = &bufferedResponseWriter{}
 		preq.Body = io.NopCloser(bytes.NewReader(pbody))
 		preq.ContentLength = int64(len(pbody))
@@ -532,7 +542,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		requestFieldRemoteDPRankOverride: true,
 		requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
 		requestFieldTransferID:           transferID,
-		"tp_size":                        s.config.MoRIIOTPSize,
+		requestFieldTPSize:               s.config.MoRIIOTPSize,
 		"remote_dp_size":                 s.config.MoRIIODPSize,
 	}
 	// Wide-EP fan-out (prefill request): remote_hosts must be the DECODE-side pod
@@ -587,7 +597,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		requestFieldRemoteDPRankOverride: true,
 		requestFieldRemoteHandshakePort:  s.config.MoRIIOPrefillHandshakePort,
 		requestFieldTransferID:           transferID,
-		"tp_size":                        s.config.MoRIIOTPSize,
+		requestFieldTPSize:               s.config.MoRIIOTPSize,
 		"remote_dp_size":                 dpLocal,
 		"is_request_leader":              true,
 	}

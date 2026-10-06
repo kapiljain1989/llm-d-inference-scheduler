@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -78,9 +79,24 @@ func chatMessage(role, content string) map[string]any {
 	return map[string]any{reqcommon.FieldRole: role, reqcommon.FieldContent: content}
 }
 
-func chatBody(messages ...any) map[string]any {
-	return map[string]any{reqcommon.FieldModel: "m", reqcommon.FieldMessages: messages}
+// requestBody returns a chat request body in the shape the proxy hands to the
+// connector: only the fields decodeRequestBody inspects are decoded, and the rest,
+// messages included, stay json.RawMessage. extra overrides or adds top-level fields.
+func requestBody(extra map[string]any, messages ...any) map[string]any {
+	fields := map[string]any{reqcommon.FieldModel: "m", reqcommon.FieldMessages: messages}
+	maps.Copy(fields, extra)
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		panic(err)
+	}
+	body, err := decodeRequestBody(raw)
+	if err != nil {
+		panic(err)
+	}
+	return body
 }
+
+func chatBody(messages ...any) map[string]any { return requestBody(nil, messages...) }
 
 // nixlDecodeResponse is a non-streaming decode response whose first choice is
 // message and whose kv_transfer_params carry the decode engine's blocks.
@@ -158,9 +174,23 @@ func TestNewKVReuseGating(t *testing.T) {
 	token := eppSessionToken(testPodNamespace, testPodName, 0)
 	body := func() map[string]any { return chatBody(chatMessage("user", "hello")) }
 
-	t.Run("applies to a chat request carrying a token for this pod", func(t *testing.T) {
+	t.Run("applies to a chat request, routed when the token names this pod", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
-		require.NotNil(t, s.newKVReuse(requestWithSession(token), body(), reqcommon.APITypeChatCompletions))
+		reuse := s.newKVReuse(requestWithSession(token), body(), reqcommon.APITypeChatCompletions)
+		require.NotNil(t, reuse)
+		require.True(t, reuse.routed)
+	})
+	t.Run("applies to the first turn, which carries no token yet", func(t *testing.T) {
+		s := newBidirectionalTestServer(t, 1)
+		reuse := s.newKVReuse(requestWithSession(""), body(), reqcommon.APITypeChatCompletions)
+		require.NotNil(t, reuse)
+		require.False(t, reuse.routed)
+	})
+	t.Run("a token for another pod is not routed", func(t *testing.T) {
+		s := newBidirectionalTestServer(t, 1)
+		reuse := s.newKVReuse(requestWithSession(eppSessionToken(testPodNamespace, "decode-1", 0)), body(), reqcommon.APITypeChatCompletions)
+		require.NotNil(t, reuse)
+		require.False(t, reuse.routed)
 	})
 	t.Run("not when the feature is off", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
@@ -168,23 +198,32 @@ func TestNewKVReuseGating(t *testing.T) {
 		s.kvReuseCache = nil
 		require.Nil(t, s.newKVReuse(requestWithSession(token), body(), reqcommon.APITypeChatCompletions))
 	})
-	t.Run("not for another pod's token", func(t *testing.T) {
-		s := newBidirectionalTestServer(t, 1)
-		require.Nil(t, s.newKVReuse(requestWithSession(eppSessionToken(testPodNamespace, "decode-1", 0)), body(), reqcommon.APITypeChatCompletions))
-	})
 	t.Run("not for another API", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
 		require.Nil(t, s.newKVReuse(requestWithSession(token), body(), reqcommon.APITypeCompletions))
 	})
 	t.Run("not for a multi-choice request", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
-		b := body()
-		b["n"] = float64(2)
+		b := requestBody(map[string]any{"n": 2}, chatMessage("user", "hello"))
+		require.Nil(t, s.newKVReuse(requestWithSession(token), b, reqcommon.APITypeChatCompletions))
+	})
+	t.Run("a single-choice request may say so explicitly", func(t *testing.T) {
+		s := newBidirectionalTestServer(t, 1)
+		for _, n := range []any{1, nil} {
+			b := requestBody(map[string]any{"n": n}, chatMessage("user", "hello"))
+			require.NotNil(t, s.newKVReuse(requestWithSession(token), b, reqcommon.APITypeChatCompletions), "n=%v", n)
+		}
+	})
+	t.Run("not for a request that truncates the prompt", func(t *testing.T) {
+		s := newBidirectionalTestServer(t, 1)
+		b := requestBody(map[string]any{"truncate_prompt_tokens": 512}, chatMessage("user", "hello"))
 		require.Nil(t, s.newKVReuse(requestWithSession(token), b, reqcommon.APITypeChatCompletions))
 	})
 	t.Run("not without messages", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
-		require.Nil(t, s.newKVReuse(requestWithSession(token), map[string]any{"model": "m"}, reqcommon.APITypeChatCompletions))
+		b, err := decodeRequestBody([]byte(`{"model":"m"}`))
+		require.NoError(t, err)
+		require.Nil(t, s.newKVReuse(requestWithSession(token), b, reqcommon.APITypeChatCompletions))
 	})
 	t.Run("not in MoRI-IO write mode", func(t *testing.T) {
 		s := newBidirectionalTestServer(t, 1)
@@ -200,14 +239,12 @@ func TestKVReuseReplaysOnlyAnExtendedHistory(t *testing.T) {
 	tools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}}}
 	echoWithExtraFields := map[string]any{
 		reqcommon.FieldRole: "assistant", reqcommon.FieldContent: "hi there",
-		"refusal": nil, "reasoning_content": "thinking", "annotations": []any{},
+		"refusal": nil, "annotations": []any{},
 	}
-	withSalt := chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more"))
-	withSalt["cache_salt"] = "tenant-b"
-	otherModel := chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more"))
-	otherModel[reqcommon.FieldModel] = "other"
-	withTools := chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more"))
-	withTools["tools"] = tools
+	msgs := func() []any {
+		return []any{chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more")}
+	}
+	with := func(extra map[string]any) map[string]any { return requestBody(extra, msgs()...) }
 
 	tests := []struct {
 		name     string
@@ -216,9 +253,12 @@ func TestKVReuseReplaysOnlyAnExtendedHistory(t *testing.T) {
 	}{
 		{"extends the turn", chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more")), true},
 		{"the echoed reply carries fields the decoder did not send", chatBody(chatMessage("user", "hello"), echoWithExtraFields, chatMessage("user", "more")), true},
-		{"a different tenant (cache_salt)", withSalt, false},
-		{"a different model", otherModel, false},
-		{"a different tool set", withTools, false},
+		{"a different tenant (cache_salt)", with(map[string]any{"cache_salt": "tenant-b"}), false},
+		{"a different model", with(map[string]any{"model": "other"}), false},
+		{"a different tool set", with(map[string]any{"tools": tools}), false},
+		{"a different reasoning effort", with(map[string]any{"reasoning_effort": "high"}), false},
+		{"a different tool_choice", with(map[string]any{"tool_choice": "none"}), false},
+		{"a different add_special_tokens", with(map[string]any{"add_special_tokens": false}), false},
 		{"an edited earlier message", chatBody(chatMessage("user", "hola"), chatMessage("assistant", "hi there"), chatMessage("user", "more")), false},
 		{"an edited reply", chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hello there"), chatMessage("user", "more")), false},
 		{"an unrelated conversation", chatBody(chatMessage("user", "other"), chatMessage("assistant", "hi there"), chatMessage("user", "more")), false},
@@ -229,7 +269,8 @@ func TestKVReuseReplaysOnlyAnExtendedHistory(t *testing.T) {
 			s := newBidirectionalTestServer(t, 1)
 			token := eppSessionToken(testPodNamespace, testPodName, 0)
 
-			first := s.newKVReuse(requestWithSession(token), chatBody(chatMessage("user", "hello")), reqcommon.APITypeChatCompletions)
+			// The first turn precedes the response that issues the session token.
+			first := s.newKVReuse(requestWithSession(""), chatBody(chatMessage("user", "hello")), reqcommon.APITypeChatCompletions)
 			require.NotNil(t, first)
 			require.Nil(t, first.take(), "a cold cache has nothing to replay")
 			require.True(t, first.store(captureJSON(t, nixlDecodeResponse(t, chatMessage("assistant", "hi there")))))
@@ -382,11 +423,11 @@ func TestInjectBidirectionalKVParamsCopiesOnlyTheNIXLContract(t *testing.T) {
 }
 
 func TestKVReuseCacheEntriesExpire(t *testing.T) {
-	cache := newKVReuseCache(Config{BidirectionalKVXfer: true, BidirectionalCacheSize: 4, BidirectionalCacheTTL: 20 * time.Millisecond})
-	cache.Add("k", map[string]any{"remote_engine_id": "e"})
+	cache := newKVReuseCache(Config{BidirectionalKVXfer: true, BidirectionalCacheSize: 4, BidirectionalCacheTTL: 150 * time.Millisecond})
+	cache.Add("k", &kvReuseEntry{params: map[string]any{"remote_engine_id": "e"}})
 	_, ok := cache.Get("k")
 	require.True(t, ok)
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(350 * time.Millisecond)
 	_, ok = cache.Get("k")
 	require.False(t, ok, "an entry outlives neither its TTL nor the engine's blocks")
 
@@ -407,4 +448,51 @@ func TestCloneSharesTheKVReuseCacheAcrossRanks(t *testing.T) {
 	second := rankOne.newKVReuse(requestWithSession(eppSessionToken(testPodNamespace, testPodName, 1)), followUp, reqcommon.APITypeChatCompletions)
 	require.NotNil(t, second, "the rank clone keeps the feature enabled")
 	require.NotNil(t, second.take())
+}
+
+func TestKVReuseReplaysOnlyToARoutedFollowUp(t *testing.T) {
+	s := newBidirectionalTestServer(t, 1)
+	first := s.newKVReuse(requestWithSession(""), chatBody(chatMessage("user", "hello")), reqcommon.APITypeChatCompletions)
+	require.True(t, first.store(captureJSON(t, nixlDecodeResponse(t, chatMessage("assistant", "hi there")))),
+		"the first turn is cached although it carries no token")
+
+	followUp := func() map[string]any {
+		return chatBody(chatMessage("user", "hello"), chatMessage("assistant", "hi there"), chatMessage("user", "more"))
+	}
+	for name, token := range map[string]string{
+		"no token":                    "",
+		"a token for another pod":     eppSessionToken(testPodNamespace, "decode-1", 0),
+		"a token for another cluster": eppSessionToken("other", testPodName, 0),
+	} {
+		require.Nil(t, s.newKVReuse(requestWithSession(token), followUp(), reqcommon.APITypeChatCompletions).take(), name)
+	}
+	require.NotNil(t, s.newKVReuse(requestWithSession(eppSessionToken(testPodNamespace, testPodName, 0)), followUp(), reqcommon.APITypeChatCompletions).take(),
+		"the refused lookups left the entry in place")
+}
+
+func TestDropBidirectionalKVParamsRestoresThePlainPrefillRequest(t *testing.T) {
+	kv := map[string]any{
+		"do_remote_decode":  true,
+		"do_remote_prefill": false,
+		"remote_engine_id":  nil,
+		"remote_block_ids":  nil,
+		"remote_host":       nil,
+		"remote_port":       nil,
+	}
+	cached, ok := completeKVParams(map[string]any{
+		"do_remote_decode": true, "remote_block_ids": []any{[]any{1}}, "remote_engine_id": "e",
+		"remote_request_id": "r", "remote_host": "h", "remote_port": json.Number("1"), "remote_num_tokens": json.Number("64"),
+	})
+	require.True(t, ok)
+	injectBidirectionalKVParams(kv, cached)
+	dropBidirectionalKVParams(kv)
+
+	require.Equal(t, map[string]any{
+		"do_remote_decode":  true,
+		"do_remote_prefill": false,
+		"remote_engine_id":  nil,
+		"remote_block_ids":  nil,
+		"remote_host":       nil,
+		"remote_port":       nil,
+	}, kv)
 }

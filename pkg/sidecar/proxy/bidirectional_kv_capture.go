@@ -28,8 +28,8 @@ import (
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
-// maxCapturedResponseBytes bounds what the capture keeps of one decode response.
-// A larger response is forwarded unchanged and never cached.
+// maxCapturedResponseBytes bounds how much of one decode response the capture
+// reads. A larger response is forwarded unchanged and never cached.
 const maxCapturedResponseBytes = 16 << 20
 
 // decodeCapture observes a Chat Completions decode response while it streams to
@@ -41,11 +41,13 @@ type decodeCapture struct {
 
 	started  bool
 	sse      bool
+	seen     int          // response bytes observed so far
 	body     bytes.Buffer // non-streaming JSON body
 	pending  []byte       // SSE bytes after the last newline
 	overflow bool
 	// unusable is set when the response cannot be reduced to one assistant
-	// message: more than one choice, or a data frame that does not parse.
+	// message: more than one choice, a data frame that does not parse, or
+	// reasoning output that a chat template may render differently on the next turn.
 	unusable bool
 
 	kvParams map[string]any
@@ -77,6 +79,13 @@ type capturedChoice struct {
 type capturedMessage struct {
 	Content   *string            `json:"content"`
 	ToolCalls []capturedToolCall `json:"tool_calls"`
+	// Reasoning is the model's reasoning text under either name vLLM has used.
+	ReasoningContent *string `json:"reasoning_content"`
+	Reasoning        *string `json:"reasoning"`
+}
+
+func (m *capturedMessage) hasReasoning() bool {
+	return (m.ReasoningContent != nil && *m.ReasoningContent != "") || (m.Reasoning != nil && *m.Reasoning != "")
 }
 
 // UnmarshalJSON reads a tool call in the wire shape. A streamed delta carries
@@ -139,12 +148,14 @@ func (c *decodeCapture) observe(p []byte) {
 	if c.overflow {
 		return
 	}
+	c.seen += len(p)
+	if c.seen > maxCapturedResponseBytes {
+		c.overflow = true
+		c.body.Reset()
+		c.pending = nil
+		return
+	}
 	if !c.sse {
-		if c.body.Len()+len(p) > maxCapturedResponseBytes {
-			c.overflow = true
-			c.body.Reset()
-			return
-		}
 		c.body.Write(p)
 		return
 	}
@@ -156,10 +167,6 @@ func (c *decodeCapture) observe(p []byte) {
 		}
 		c.absorbLine(c.pending[:i])
 		c.pending = c.pending[i+1:]
-	}
-	if len(c.pending) > maxCapturedResponseBytes {
-		c.overflow = true
-		c.pending = nil
 	}
 }
 
@@ -206,6 +213,9 @@ func (c *decodeCapture) absorb(data []byte, streaming bool) {
 }
 
 func (c *decodeCapture) absorbMessage(m *capturedMessage) {
+	if m.hasReasoning() {
+		c.unusable = true
+	}
 	if m.Content != nil {
 		c.content.WriteString(*m.Content)
 	}
@@ -218,6 +228,9 @@ func (c *decodeCapture) absorbMessage(m *capturedMessage) {
 // absorbDelta folds one streamed delta in. Tool calls arrive in fragments keyed
 // by index: the id and name in the first, the arguments spread across the rest.
 func (c *decodeCapture) absorbDelta(d *capturedMessage) {
+	if d.hasReasoning() {
+		c.unusable = true
+	}
 	if d.Content != nil {
 		c.content.WriteString(*d.Content)
 	}
@@ -276,15 +289,15 @@ func (c *decodeCapture) result() (params, reply map[string]any, ok bool) {
 		calls := make([]any, len(c.calls))
 		for i, call := range c.calls {
 			calls[i] = map[string]any{
-				"id":   call.id,
-				"type": "function",
-				"function": map[string]any{
-					"name":      call.name,
-					"arguments": call.arguments,
+				toolCallFieldID:   call.id,
+				toolCallFieldType: toolCallTypeFunction,
+				toolCallFieldFunction: map[string]any{
+					toolCallFieldName:      call.name,
+					toolCallFieldArguments: call.arguments,
 				},
 			}
 		}
-		reply["tool_calls"] = calls
+		reply[messageFieldToolCalls] = calls
 	}
 	return params, reply, true
 }

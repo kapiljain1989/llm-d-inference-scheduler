@@ -91,7 +91,8 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 	}
 
 	// chat posts a chat completion with the given history, routed to the test
-	// prefiller, carrying the session token the EPP issued for rank 0 of pod.
+	// prefiller, carrying the session token the EPP issued for rank 0 of pod. An
+	// empty pod sends no token, as the first turn of a conversation does.
 	chat := func(pod string, stream bool, messages ...any) {
 		GinkgoHelper()
 		body, err := json.Marshal(map[string]any{
@@ -105,7 +106,9 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 		Expect(err).ToNot(HaveOccurred())
 		req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
 		req.Header.Add(routing.KVCacheSourceHeader, kvCacheSource)
-		req.Header.Add(sessionutil.DefaultHeader, eppSessionToken(testPodNamespace, pod, 0))
+		if pod != "" {
+			req.Header.Add(sessionutil.DefaultHeader, eppSessionToken(testPodNamespace, pod, 0))
+		}
 		resp, err := http.DefaultClient.Do(req)
 		Expect(err).ToNot(HaveOccurred())
 		defer resp.Body.Close()
@@ -114,11 +117,12 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 		Expect(resp.StatusCode).To(Equal(http.StatusOK), string(b))
 	}
 
-	// prefillKV returns the kv_transfer_params of the i-th prefill request.
+	// prefillKV returns the kv_transfer_params of the i-th prefill request, which
+	// must be the most recent one.
 	prefillKV := func(i int) map[string]any {
 		GinkgoHelper()
 		reqs := testInfo.prefillHandler.GetCompletionRequests()
-		Expect(len(reqs)).To(BeNumerically(">", i))
+		Expect(reqs).To(HaveLen(i + 1))
 		kv, ok := reqs[i][reqcommon.FieldKVTransferParams].(map[string]any)
 		Expect(ok).To(BeTrue())
 		return kv
@@ -131,7 +135,7 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 
 	It("replays the previous turn's decode-side blocks next to the P2P source", func() {
 		start()
-		chat(testPodName, false, turn1()...)
+		chat("", false, turn1()...)
 		Expect(prefillKV(0)).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, BeNil()), "a cold conversation has nothing to replay")
 
 		chat(testPodName, false, turn2()...)
@@ -152,7 +156,7 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 
 	It("replays an entry once", func() {
 		start()
-		chat(testPodName, false, turn1()...)
+		chat("", false, turn1()...)
 		chat(testPodName, false, turn2()...)
 		Expect(prefillKV(1)).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, "decode-engine"))
 
@@ -164,14 +168,14 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 
 	It("does not replay into a conversation whose history differs", func() {
 		start()
-		chat(testPodName, false, turn1()...)
+		chat("", false, turn1()...)
 		chat(testPodName, false, chatMessage("user", "Hello"), chatMessage("assistant", "Something else"), chatMessage("user", "And now?"))
 		Expect(prefillKV(1)).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, BeNil()))
 	})
 
 	It("ignores a session token for another pod", func() {
 		start()
-		chat("decode-1", false, turn1()...)
+		chat("", false, turn1()...)
 		chat("decode-1", false, turn2()...)
 		Expect(prefillKV(1)).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, BeNil()))
 	})
@@ -181,7 +185,7 @@ var _ = Describe("NIXL Connector (v2) bidirectional KV transfer", func() {
 		testInfo.decodeHandler.RawResponseType = eventStreamContentType
 		start()
 
-		chat(testPodName, true, turn1()...)
+		chat("", true, turn1()...)
 		chat(testPodName, true, turn2()...)
 		Expect(prefillKV(1)).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, "decode-engine"))
 	})

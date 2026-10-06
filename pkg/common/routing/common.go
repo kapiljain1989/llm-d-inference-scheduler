@@ -41,6 +41,10 @@ const (
 	// instead of recomputing them
 	KVCacheSourceHeader = "x-kv-cache-source-host-port"
 
+	// SessionTokenHeader is the default header carrying the session-affinity
+	// token: the EPP writes it on a response and a client echoes it on later requests.
+	SessionTokenHeader = "x-session-token"
+
 	// InferencePoolAPIGroup is the default InferencePool API group
 	InferencePoolAPIGroup = "inference.networking.k8s.io"
 

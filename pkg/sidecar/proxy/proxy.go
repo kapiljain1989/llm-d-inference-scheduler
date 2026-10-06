@@ -217,13 +217,15 @@ type Config struct {
 	// the history. Only meaningful with --kv-connector=nixlv2 and Chat Completions.
 	BidirectionalKVXfer bool
 	// BidirectionalSessionHeader is the request header carrying the EPP session
-	// token, which must name an endpoint of this pod for a request to take part.
+	// token, which must name an endpoint of this pod for a request to receive a replay.
 	BidirectionalSessionHeader string
 	// BidirectionalCacheSize is the maximum number of cached decode-side
 	// kv_transfer_params entries, one per conversation turn awaiting its follow-up.
 	BidirectionalCacheSize int
-	// BidirectionalCacheTTL is how long an entry stays usable. It must not exceed
-	// the engine's decoder KV block TTL, after which the blocks are released.
+	// BidirectionalCacheTTL is how long an entry stays usable. It must stay below
+	// the engine's decoder KV block TTL, after which the blocks are released: the
+	// engine starts its timer when the request finishes and the sidecar when the
+	// response has been delivered.
 	BidirectionalCacheTTL time.Duration
 	// PodName and PodNamespace identify this pod, matched against the endpoint
 	// the EPP encodes in the session token. Populated from POD_NAME and
@@ -290,7 +292,7 @@ type Server struct {
 	// kvReuseCache holds decode-side kv_transfer_params awaiting the conversation's
 	// next request (see bidirectional_kv.go). Shared by data-parallel rank clones.
 	// Nil unless config.BidirectionalKVXfer.
-	kvReuseCache *expirable.LRU[string, map[string]any]
+	kvReuseCache *expirable.LRU[string, *kvReuseEntry]
 
 	// dpBasePort is the rank-0 proxy port. Rank clones override config.Port
 	// (data_parallel.go), so rank derivation from a routed endpoint's port

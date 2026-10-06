@@ -139,3 +139,48 @@ func TestDecodeCaptureIgnoresSSEComments(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "a", reply["content"])
 }
+
+func TestDecodeCaptureRefusesReasoningOutput(t *testing.T) {
+	t.Run("streamed", func(t *testing.T) {
+		stream := sseFrames(
+			`{"choices":[{"index":0,"delta":{"reasoning_content":"thinking"}}]}`,
+			`{"choices":[{"index":0,"delta":{"content":"answer"}}]}`,
+			captureKVFrame,
+		)
+		_, c := captureSSE(t, stream, 64)
+		_, _, ok := c.result()
+		require.False(t, ok, "a template may render reasoning differently on the next turn")
+	})
+	t.Run("complete message", func(t *testing.T) {
+		body := `{"choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning":"thinking"}}],` +
+			`"kv_transfer_params":{"do_remote_decode":true,"remote_block_ids":[[1]],"remote_engine_id":"e","remote_request_id":"r","remote_host":"h","remote_port":1}}`
+		_, _, ok := captureJSON(t, []byte(body)).result()
+		require.False(t, ok)
+	})
+	t.Run("empty reasoning fields are ignored", func(t *testing.T) {
+		stream := sseFrames(
+			`{"choices":[{"index":0,"delta":{"role":"assistant","content":"a","reasoning_content":null,"reasoning":""}}]}`,
+			captureKVFrame,
+		)
+		_, c := captureSSE(t, stream, 64)
+		_, _, ok := c.result()
+		require.True(t, ok)
+	})
+}
+
+func TestDecodeCaptureStopsReadingOversizedResponses(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/event-stream")
+	w, c := newDecodeCapture(rec)
+	frame := "data: " + `{"choices":[{"index":0,"delta":{"content":"` + strings.Repeat("x", 1<<20) + `"}}]}` + "\n\n"
+	for written := 0; written <= maxCapturedResponseBytes; written += len(frame) {
+		_, err := w.Write([]byte(frame))
+		require.NoError(t, err)
+	}
+	_, err := w.Write([]byte(sseFrames(captureKVFrame)))
+	require.NoError(t, err)
+
+	_, _, ok := c.result()
+	require.False(t, ok, "a response over the limit is never cached")
+	require.Greater(t, rec.Body.Len(), maxCapturedResponseBytes, "the client still receives all of it")
+}

@@ -688,24 +688,32 @@ Requirements:
 
 - The engines run NIXL with `"bidirectional_kv_xfer": true` in
   `kv_connector_extra_config`. The decode engine releases its blocks after
-  `decoder_kv_blocks_ttl` (default 480 seconds), so `--bidirectional-cache-ttl`
-  must not exceed it.
+  `decoder_kv_blocks_ttl` (default 480 seconds), counted from the end of the
+  decode request. `--bidirectional-cache-ttl` (default 450 seconds) must stay
+  below it, because the sidecar's timer starts once the response has been
+  delivered.
 - The EPP runs the session-affinity plugin with the encoded-endpoint strategy,
   so a follow-up returns to the same decode pod and carries the pod's session
   token (`x-session-token` by default; `--bidirectional-session-header` renames
-  it). The sidecar accepts a token only when it names an endpoint of its own
-  pod, so `POD_NAME` and `POD_NAMESPACE` must be set from the downward API. Any
-  client can construct a token; it selects the feature for a request and does
-  not authenticate the caller.
-- Requests are Chat Completions with a single choice. Other APIs, `n` greater
-  than 1, MoRI-IO write mode, and chunked decode (`--decode-chunk-size`) are
-  not supported; those requests run the ordinary P/D flow.
+  it). The EPP issues the token on a response, so the first turn of a
+  conversation has none: the sidecar caches every eligible turn, and replays only
+  to a request whose token names an endpoint of its own pod. `POD_NAME` and
+  `POD_NAMESPACE` must be set from the downward API for that comparison. Any
+  client can construct a token, so it marks a routed follow-up and does not
+  authenticate the caller.
+- Requests are Chat Completions with a single choice and no
+  `truncate_prompt_tokens`. Requests that differ (other APIs, `n` greater than 1,
+  prompt truncation) run the ordinary P/D flow. The sidecar refuses to start
+  with MoRI-IO write mode or chunked decode (`--decode-chunk-size`).
+- The decoder returns no reasoning output for the turn. A response that carries
+  reasoning text is not cached, because a chat template may render it
+  differently on the next turn.
 
 The prefill engine copies the replayed blocks over the leading blocks of the new
 prompt without comparing token contents. The sidecar therefore addresses each
 cached entry by a digest of the request fields that determine the prompt tokens
-(`model`, `cache_salt`, `tools`, `chat_template`, `chat_template_kwargs`, and
-similar) and of the full message history, including the reply the decoder
+(`model`, `cache_salt`, `tools`, `tool_choice`, `reasoning_effort`,
+`chat_template`, `chat_template_kwargs`, and similar) and of the full message history, including the reply the decoder
 generated. A follow-up gets an entry only when its messages extend the turn that
 produced it field for field. A different conversation or tenant, an edited
 message or reply, or a changed tool set misses, and prefill recomputes as usual.
@@ -792,7 +800,7 @@ Enabling the flag requires:
 | `nixlv2` | `--enable-bidirectional-kv-xfer` | — | `false` | Let the prefill engine read a conversation's KV blocks from the decode engine that served its previous turn. See [Bidirectional KV Transfer](#bidirectional-kv-transfer-nixlv2). Requires `POD_NAME` and `POD_NAMESPACE`. |
 | `nixlv2` | `--bidirectional-session-header` | — | `x-session-token` | Request header carrying the EPP session token. Must match the session-affinity plugin's header. |
 | `nixlv2` | `--bidirectional-cache-size` | — | `4096` | Maximum number of conversation turns whose decode-side KV blocks are kept for a follow-up request. |
-| `nixlv2` | `--bidirectional-cache-ttl` | — | `480s` | How long a turn's decode-side KV blocks stay usable. Must not exceed the engine's `decoder_kv_blocks_ttl`. |
+| `nixlv2` | `--bidirectional-cache-ttl` | — | `450s` | How long a turn's decode-side KV blocks stay usable. Must stay below the engine's `decoder_kv_blocks_ttl`. |
 
 ---
 
